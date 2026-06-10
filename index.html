@@ -1,0 +1,2617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ONE SHOTICUS</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<!-- Pixel font (game falls back to monospace if offline) -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #06060a; }
+  body { display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
+  #fontload { position: absolute; left: -9999px; top: -9999px; font-family: 'Press Start 2P', monospace; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/phaser/3.60.0/phaser.min.js"></script>
+</head>
+<body>
+<div id="game"></div>
+<span id="fontload">.</span>
+<script>
+'use strict';
+/* ================================================================
+   ONE SHOTICUS v2 - "the cooler sprites update"
+   a roguelike about punching once and dying once.
+   now with hand-drawn pixels, big rooms, and 8 bosses
+   who all think they are the main character.
+   ================================================================ */
+
+// ---------------- constants ----------------
+const W = 800, H = 600;
+const ROOMS_PER_FLOOR = 4;          // 3 combat rooms + 1 boss room
+const ROOM_ZOOM = 1.5;              // follow-cam zoom in combat rooms
+const FONT = '"Press Start 2P", monospace';
+const BOSS_ARENA = { w: 760, h: 520 };  // fully visible at zoom 1
+const ROOM_SIZES = [
+  { w: 880, h: 620 }, { w: 1040, h: 700 }, { w: 1180, h: 780 }, { w: 1280, h: 860 }
+];
+
+// rotating flavor text. the game believes in you. (it does not.)
+const SUBTITLES = [
+  'one punch. one mistake. game over.',
+  'enemies feared you. briefly.',
+  'floor 2 is theoretically possible',
+  'hp bars are for cowards',
+  'undefeated. until defeated.',
+  'now with 100% more skeletons',
+  'the chests are lying to you'
+];
+const DEATH_LINES = [
+  "you were so close (you weren't)",
+  'enemies feared you. briefly.',
+  'floor 2 is theoretically possible',
+  'have you tried simply not dying?',
+  'one punch wonder. emphasis on one.',
+  'they only had to touch you. they did.',
+  'skill issue (affectionate)',
+  'your ghost is also dead now',
+  'the chest was lying. obviously.',
+  'shield knights hate this one trick',
+  'punched everything but the problem'
+];
+const UPGRADES = [
+  { key: 'speed',   name: 'GREASED BOOTS',     desc: '+12% move speed',          flavor: 'run from your problems faster' },
+  { key: 'range',   name: 'LONGER ARMS',       desc: 'punch range +1 tile',      flavor: 'personal space, extended' },
+  { key: 'slow',    name: 'INTIMIDATION',      desc: 'enemies 10% slower',       flavor: 'they heard what you did' },
+  { key: 'bonus',   name: 'CAPITALISM',        desc: '+100 room clear bonus',    flavor: 'points fix everything' },
+  { key: 'cd',      name: 'QUICK HANDS',       desc: 'punch cooldown -60ms',     flavor: 'jab jab jab jab jab' },
+  { key: 'grace',   name: 'DRAMATIC ENTRANCE', desc: 'enemies wake up later',    flavor: 'they respect a good entrance' },
+  { key: 'deflect', name: 'DEFLECTOR FORM',    desc: 'punch swats bullets wider',flavor: 'the bullets are also rude' },
+  { key: 'sense',   name: 'COWARD SENSE',      desc: 'enemy windups 30% longer', flavor: 'fear is a free upgrade' },
+  { key: 'tip',     name: 'TIP JAR',           desc: '+5 points per kill',       flavor: 'violence, but monetized' }
+];
+
+// ---------------- run state & saves ----------------
+const RUN = {
+  floor: 1, room: 1, score: 0,
+  up: {},
+  reset() {
+    this.floor = 1; this.room = 1; this.score = 0;
+    this.up = { speed: 0, range: 0, slow: 0, bonus: 0, cd: 0, grace: 0, deflect: 0, sense: 0, tip: 0 };
+  }
+};
+RUN.reset();
+function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+const SAVE = {
+  get bestFloor() { return +(lsGet('os_bestFloor') || 0); },
+  get bestScore() { return +(lsGet('os_bestScore') || 0); }
+};
+function saveBest() {
+  if (RUN.floor > SAVE.bestFloor) lsSet('os_bestFloor', RUN.floor);
+  if (RUN.score > SAVE.bestScore) lsSet('os_bestScore', RUN.score);
+}
+
+// ---------------- derived stats (base + upgrades) ----------------
+function playerSpeed()  { return 200 * (1 + RUN.up.speed * 0.12); }
+function punchRange()   { return 26 + RUN.up.range * 22; }
+function punchCooldown(){ return Math.max(120, 300 - RUN.up.cd * 60); }
+function enemySlowMult(){ return Math.max(0.55, 1 - RUN.up.slow * 0.10); }
+function clearBonus()   { return 50 + RUN.up.bonus * 100; }
+function graceTime()    { return 800 + RUN.up.grace * 400; }
+function telegraphMult(){ return 1 + RUN.up.sense * 0.30; }   // longer enemy windups
+function deflectPad()   { return RUN.up.deflect * 14; }       // wider bullet-swat zone
+function tipBonus()     { return RUN.up.tip * 5; }            // flat points per kill
+
+// ---------------- enemy roster ----------------
+// debut floor per family; weight 3 on its debut floor so you actually meet it
+const FAM_DEBUT = { skel: 1, imp: 2, bat: 3, turret: 4, slime: 5, ghost: 6, knight: 7, bomber: 8, summoner: 9, sniper: 10 };
+const ROOM_CAPS = { turret: 3, summoner: 2, sniper: 2, knight: 3 };
+const SCORE_VALUES = { skel: 10, imp: 20, bat: 25, turret: 30, slime: 25, mini: 5, ghost: 30, knight: 40, bomber: 30, summoner: 40, sniper: 35, mimic: 45 };
+function enemyPool(f) {
+  const pool = [];
+  for (const fam in FAM_DEBUT) {
+    if (f < FAM_DEBUT[fam]) continue;
+    let w = fam === 'skel' ? 2 : 1;
+    if (f === FAM_DEBUT[fam]) w = 3;
+    for (let i = 0; i < w; i++) pool.push(fam);
+  }
+  return pool;
+}
+function eliteChance(f) { return f < 12 ? 0 : Math.min(0.35, (f - 11) * 0.06); }
+
+// ---------------- bosses ----------------
+const BOSS_DEFS = [
+  { key: 'gear',  name: 'GEAR SAINT',     quip: 'employee of every month' },
+  { key: 'warden',name: 'THE WARDEN',     quip: 'you are the prison' },
+  { key: 'mino',  name: 'MINOTAURUS',     quip: 'no bull. okay, some bull.' },
+  { key: 'sking', name: 'SPLITTER KING',  quip: 'math was a mistake' },
+  { key: 'queen', name: 'SUMMONER QUEEN', quip: 'she has a group chat' },
+  { key: 'cust',  name: 'THE CUSTODIAN',  quip: 'sweep. mop. repeat.' },
+  { key: 'orb',   name: 'THE ORB',        quip: 'do not perceive it' },
+  { key: 'rex',   name: 'SHOTICUS REX',   quip: 'your build, but worse' }
+];
+function bossIndex(f) { return (f - 1) % 8; }
+// floors past 8 reuse archetypes but faster, with stacked extras
+function bossSpeedMult(f) { return enemySlowMult() * (1 + Math.max(0, f - 8) * 0.07); }
+
+// ---------------- floor themes ----------------
+// env: '1' darkest..'4' lightest structural tone, 'a' accent
+// over: palette overrides applied to every enemy texture of that theme
+const THEMES = [
+  { name: 'THE DUNGEON',
+    env: { 1: 0x14141d, 2: 0x23232e, 3: 0x3d3d49, 4: 0x575764, a: 0xff9a3c },
+    over: {} },
+  { name: 'THE CATACOMBS',
+    env: { 1: 0x121521, 2: 0x202637, 3: 0x39435c, 4: 0x55628a, a: 0x58c5ff },
+    over: { b: 0xb9c5d8, B: 0x76849c, r: 0x58c5ff, o: 0x7f9af2, O: 0x4a5fb0, h: 0xd0e0ff,
+            g: 0x54d8d8, G: 0x1f8f8f, n: 0xc0ffff, u: 0x6a8fe8, U: 0x3a55a0,
+            c: 0x9a6ae8, C: 0x5e3aa0, m: 0x4a90e8, M: 0x2a5090 } },
+  { name: 'THE SWAMP',
+    env: { 1: 0x10160e, 2: 0x1c2618, 3: 0x344226, 4: 0x4f6238, a: 0x6ede54 },
+    over: { b: 0xbfd6a0, B: 0x7d9460, r: 0x3fe06a, o: 0x9ec43f, O: 0x5f7a1a,
+            g: 0x9ade3f, u: 0x7aa05f, U: 0x46622f, v: [0xc8e8c0, 0.85], V: [0x86a880, 0.85],
+            k: 0x8fb89a, K: 0x4f7a5e } },
+  { name: 'THE FORGE',
+    env: { 1: 0x190f0c, 2: 0x2a1a14, 3: 0x4a3226, 4: 0x6b4a36, a: 0xff7a3c },
+    over: { b: 0xf2c49a, B: 0xb07a50, r: 0xffe066, g: 0xff9a4c, G: 0xb05a1c, n: 0xffd9a0,
+            o: 0xff6a3c, O: 0xb03a14, u: 0xd86a4a, U: 0x8e3a24,
+            t: 0xe87a4a, T: 0x9e4020, i: 0xffe066, m: 0xd84a3a, M: 0x8e2418 } },
+  { name: 'THE VOID',
+    env: { 1: 0x110d1c, 2: 0x1d1730, 3: 0x352a52, 4: 0x4f4076, a: 0xc95fff },
+    over: { b: 0xc9a8e8, B: 0x8060b0, r: 0xff5fd0, o: 0xb06ae8, O: 0x7a3fb0,
+            g: 0xc95fff, G: 0x7e2fb0, n: 0xf0c0ff, t: 0x8a5fd0, T: 0x55309a, i: 0xff5fd0,
+            c: 0xe85fd0, C: 0x9a3a8a, k: 0xa08fd0, K: 0x5e4f9a } }
+];
+function themeIdx(f) { return Math.floor((f - 1) / 3) % THEMES.length; }
+
+// ---------------- master palette (char -> color) ----------------
+// every sprite matrix below draws with these; themes override per-char
+const PAL = {
+  '#': 0x15121f, 'w': 0xffffff, 'p': 0x222230, 'x': 0x0c0c14,
+  'f': 0xffcf9e, 'F': 0xd9a066,                  // skin
+  'y': 0xffd23f, 'Y': 0xb8901f,                  // hero suit
+  'r': 0xe84545, 'R': 0x8e1f1f,                  // red: gloves, eyes
+  'b': 0xe8e4d8, 'B': 0xa09a85,                  // bone
+  'o': 0xf7941d, 'O': 0xb35f0a, 'h': 0xffe9b0,   // imp + horns
+  'u': 0x9a5fd0, 'U': 0x5e2f90,                  // bat wing
+  't': 0x4a90e8, 'T': 0x1f4f8e, 'i': 0x58c5ff,   // turret + iris
+  'g': 0x6ede54, 'G': 0x2f9e3f, 'n': 0xc9ffb0,   // slime + shine
+  'v': [0xcdd6ff, 0.88], 'V': [0x8f9ad0, 0.88],  // ghost (translucent)
+  'k': 0x8fa3c8, 'K': 0x54618a,                  // knight steel
+  's': 0xd9c46a, 'S': 0x96823a,                  // shield gold
+  'q': 0x3a3a46, 'Q': 0x23232e, 'z': 0xff7a3c,   // bomber + fuse ember
+  'm': 0x8a4ce8, 'M': 0x552f96,                  // summoner robe
+  'c': 0xd84a6a, 'C': 0x8e2640,                  // sniper crimson
+  'd': 0xffd23f, 'D': 0xb8901f,                  // boss gold / crown
+  'e': 0x9bdcff, 'E': 0x2a7ab0                   // projectile blue
+};
+
+// ---------------- pixel-matrix texture engine ----------------
+// rows: array of strings, one char per pixel ('.' or ' ' = transparent)
+function makePix(scene, key, rows, pal, stamp) {
+  if (scene.textures.exists(key)) return;
+  const w = Math.max.apply(null, rows.map(r => r.length)), h = rows.length;
+  const g = scene.make.graphics({ x: 0, y: 0, add: false });
+  const draw = (rws, p, ox, oy) => {
+    for (let y = 0; y < rws.length; y++) {
+      const row = rws[y];
+      for (let x = 0; x < row.length; x++) {
+        const ch = row[x];
+        if (ch === '.' || ch === ' ') continue;
+        const v = p[ch];
+        if (v === undefined) continue;
+        g.fillStyle(Array.isArray(v) ? v[0] : v, Array.isArray(v) ? v[1] : 1);
+        g.fillRect(ox + x, oy + y, 1, 1);
+      }
+    }
+  };
+  draw(rows, pal, 0, 0);
+  if (stamp) draw(stamp.rows, stamp.pal, stamp.ox || 0, stamp.oy || 0);
+  g.generateTexture(key, w, h);
+  g.destroy();
+}
+// cheap second animation frames
+function mirrorRows(rows) { return rows.map(r => r.split('').reverse().join('')); }
+function shiftUpRows(rows) { return rows.slice(1).concat(['.'.repeat(rows[0].length)]); }
+// palette tools
+function withOver(base, over) { return Object.assign({}, base, over); }
+function darkenInt(col, m) {
+  const r = Math.round(((col >> 16) & 255) * m), g = Math.round(((col >> 8) & 255) * m), b = Math.round((col & 255) * m);
+  return (r << 16) | (g << 8) | b;
+}
+// elites: darker body, furious eyes; a crown gets stamped on separately
+function elitePal(pal) {
+  const out = {};
+  for (const ch in pal) {
+    const v = pal[ch];
+    if (ch === '#' || ch === 'w' || ch === 'x') { out[ch] = v; continue; }
+    out[ch] = Array.isArray(v) ? [darkenInt(v[0], 0.7), v[1]] : darkenInt(v, 0.7);
+  }
+  out.r = 0xff3050; out.i = 0xff3050;
+  return out;
+}
+const CROWN = {
+  rows: ['d..dd..d', 'dd.dd.dd', 'dddddddd'],
+  pal: { d: 0xffd23f }
+};
+
+// ---------------- small helpers ----------------
+// in GameScene there are two cameras; world objects must be hidden from the
+// UI cam and vice versa. these no-op in single-camera scenes.
+function tagW(scene, o) { if (scene.uiCam) scene.uiCam.ignore(o); return o; }
+function tagU(scene, o) { if (scene.uiCam) scene.cameras.main.ignore(o); return o; }
+// the scene clock is stale during create() right after a scene transition;
+// the master loop clock is always current and matches update()'s time param
+function nowMs(scene) { return scene.game.loop.time; }
+
+function ptext(scene, x, y, str, size, color) {
+  return scene.add.text(x, y, str, {
+    fontFamily: FONT, fontSize: size + 'px', color: color || '#ffffff', align: 'center'
+  }).setOrigin(0.5);
+}
+function hudStyle() {
+  return { fontFamily: FONT, fontSize: '10px', color: '#cfcfe0', lineSpacing: 8 };
+}
+// rises from a world position and fades (world-space)
+function floatText(scene, x, y, str, color) {
+  const t = tagW(scene, ptext(scene, x, y, str, 8, color || '#ffffff')).setDepth(9);
+  scene.tweens.add({ targets: t, y: y - 26, alpha: 0, duration: 650, ease: 'Cubic.easeOut', onComplete: () => t.destroy() });
+}
+// big centered announcement (screen-space)
+function banner(scene, str, color, size) {
+  const t = tagU(scene, ptext(scene, W / 2, H / 2 - 60, str, size || 22, color)).setAlpha(0).setDepth(20);
+  scene.tweens.add({ targets: t, alpha: 1, y: H / 2 - 76, duration: 220, yoyo: true, hold: 650, onComplete: () => t.destroy() });
+}
+// pixel explosion: little squares scatter from a point and fade (world-space)
+function pixelBurst(scene, x, y, color, n, big) {
+  n = n || 12;
+  for (let i = 0; i < n; i++) {
+    const p = tagW(scene, scene.add.image(x, y, 'pix').setTint(color)).setDepth(8);
+    if (big) p.setScale(1 + Math.random() * 1.6);
+    const a = Math.random() * Math.PI * 2;
+    const d = (big ? 36 : 0) + 18 + Math.random() * 52;
+    scene.tweens.add({
+      targets: p, x: x + Math.cos(a) * d, y: y + Math.sin(a) * d,
+      alpha: 0, angle: Phaser.Math.Between(-180, 180),
+      duration: 320 + Math.random() * 280, ease: 'Cubic.easeOut',
+      onComplete: () => p.destroy()
+    });
+  }
+}
+
+/* ================================================================
+   AUDIO - chiptune engine. no files, just oscillators with attitude.
+   music is note-strings parsed to a 32-step sequencer; sfx are
+   little envelope-shaped bursts. M toggles mute (persisted).
+   ================================================================ */
+const BASS_AM = 'A2 A3 A2 A3 A2 A3 A2 A3 | C3 C4 C3 C4 C3 C4 C3 C4 | G2 G3 G2 G3 G2 G3 G2 G3 | E2 E3 E2 E3 E2 E3 E2 E3';
+const LEAD_TITLE = 'A4 - C5 A4 E5 - D5 C5 | C5 D5 E5 C5 G5 - E5 D5 | G4 - B4 D5 G5 E5 D5 B4 | E4 - G4 B4 A4 - - -';
+const SONGS = {
+  title: { bpm: 122, bassType: 'triangle', leadType: 'pulse', vib: 0,
+    bass: BASS_AM, lead: LEAD_TITLE,
+    drums: 'KhhhShKhKhhhShKhKhhhShKhKhhhShSS' },
+  theme0: { bpm: 150, bassType: 'triangle', leadType: 'pulse', vib: 0,
+    bass: BASS_AM,
+    lead: 'E5 - C5 E5 A5 - G5 E5 | E5 G5 A5 G5 E5 - C5 D5 | D5 - B4 D5 G5 - D5 B4 | C5 B4 A4 B4 E5 - - -',
+    drums: 'KhKhShKhKhKhShKhKhKhShKhKhKhShSS' },
+  theme1: { bpm: 104, bassType: 'triangle', leadType: 'triangle', vib: 8,
+    bass: 'A2 - - - A2 - A3 - | E2 - - - E2 - E3 - | F2 - - - F2 - F3 - | G2 - - - G2 - G3 -',
+    lead: 'A5 - - E5 - - C5 - | B4 - - - E5 - - - | F5 - - C5 - - A4 - | B4 - - - - - - -',
+    drums: 'K.h.S...K.h.S...K.h.S...K.h.S..h' },
+  theme2: { bpm: 132, bassType: 'triangle', leadType: 'pulse', vib: 0, swing: 0.14,
+    bass: 'A2 - A3 . A2 A3 C3 . | D3 - D3 . C3 . A2 . | A2 - A3 . A2 A3 C3 . | E3 - D3 . C3 . D3 .',
+    lead: '. . A4 C5 . D5 . C5 | . . D5 E5 . - C5 A4 | . . A4 C5 . E5 . D5 | C5 A4 G4 A4 - - . .',
+    drums: 'K.hKS.h.K.hKS.h.K.hKS.h.K.hKS.hS' },
+  theme3: { bpm: 160, bassType: 'square', bassVol: 0.10, leadType: 'pulse', vib: 0,
+    bass: 'A2 A2 A2 A2 A2 A2 G2 A2 | F2 F2 F2 F2 F2 F2 E2 F2 | G2 G2 G2 G2 G2 G2 F2 G2 | E2 E2 E2 E2 E3 E3 E2 E2',
+    lead: 'A4 . A4 C5 . C5 D5 . | F5 - E5 D5 C5 - A4 . | G4 . G4 B4 . B4 D5 . | E5 - D5 B4 E4 - - .',
+    drums: 'KhKhShKhKhKhShKhKhKhShKhKKhKShSS' },
+  theme4: { bpm: 112, bassType: 'triangle', leadType: 'triangle', vib: 14,
+    bass: 'A2 - E3 - C3 - E3 - | F2 - C3 - F3 - C3 - | C3 - G3 - E3 - G3 - | E2 - B2 - E3 - B2 -',
+    lead: 'E5 - - - C5 - A4 - | A5 - - - F5 - C5 - | G5 - - E5 - - C5 - | B4 - - - - - E4 -',
+    drums: 'K...h.S.K...h.S.K...h.S.K..hh.S.' },
+  boss: { bpm: 168, bassType: 'triangle', leadType: 'pulse', vib: 0,
+    bass: 'A2 A3 A2 A3 A2 A3 A2 A3 | Bb2 Bb3 Bb2 Bb3 Bb2 Bb3 Bb2 Bb3 | A2 A3 A2 A3 A2 A3 A2 A3 | E2 E3 E2 E3 G#2 G#3 E2 E3',
+    lead: 'A4 C5 E5 C5 A4 C5 E5 C5 | Bb4 D5 F5 D5 Bb4 D5 F5 D5 | A4 C5 E5 A5 - G5 E5 C5 | E5 - G#4 B4 E5 - - -',
+    drums: 'KhShKhShKhShKhShKhShKhShKhShKSSS' },
+  bossrex: { bpm: 140, bassType: 'square', bassVol: 0.10, leadType: 'pulse', vib: 25,
+    bass: BASS_AM, lead: LEAD_TITLE,
+    drums: 'KhShKhShKhShKhShKhShKhShKhShKSSS' }
+};
+const NOTE_SEMI = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+function parseTrack(str) {
+  const out = [];
+  for (const tok of str.split(/[\s|]+/)) {
+    if (!tok) continue;
+    if (tok === '.') { out.push(0); continue; }
+    if (tok === '-') { out.push(-1); continue; }
+    const m = /^([A-G])(#|b)?(\d)$/.exec(tok);
+    out.push(m ? 12 * (+m[3] + 1) + NOTE_SEMI[m[1]] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0) : 0);
+  }
+  return out;
+}
+
+const AUDIO = {
+  ctx: null, master: null, musicGain: null, sfxGain: null, noiseBuf: null,
+  muted: lsGet('os_muted') === '1',
+  want: null, current: null, loopTimer: null, passNodes: [], pulse: null,
+
+  init() {
+    if (this.ctx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    this.ctx = new AC();
+    this.master = this.ctx.createGain();
+    this.master.gain.value = this.muted ? 0 : 0.4;
+    this.master.connect(this.ctx.destination);
+    this.musicGain = this.ctx.createGain(); this.musicGain.gain.value = 0.7; this.musicGain.connect(this.master);
+    this.sfxGain = this.ctx.createGain(); this.sfxGain.gain.value = 1.0; this.sfxGain.connect(this.master);
+    const len = this.ctx.sampleRate * 0.6;
+    this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const d = this.noiseBuf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    const n = 24, re = new Float32Array(n), im = new Float32Array(n);
+    for (let i = 1; i < n; i++) re[i] = (2 / (i * Math.PI)) * Math.sin(i * Math.PI * 0.25);
+    this.pulse = this.ctx.createPeriodicWave(re, im);
+    for (const k in SONGS) {
+      const s = SONGS[k];
+      s._bass = parseTrack(s.bass); s._lead = parseTrack(s.lead);
+    }
+  },
+  unlock() {
+    this.init();
+    if (!this.ctx) return;
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+    if (this.want && !this.current) this._startLoop(this.want);
+  },
+  ready() { return !!this.ctx && this.ctx.state === 'running'; },
+  toggleMute() {
+    this.muted = !this.muted;
+    lsSet('os_muted', this.muted ? '1' : '0');
+    if (this.master) this.master.gain.setTargetAtTime(this.muted ? 0 : 0.4, this.ctx.currentTime, 0.02);
+  },
+
+  _tone(type, midi, t, dur, vol, detune, bus) {
+    const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+    if (type === 'pulse') o.setPeriodicWave(this.pulse); else o.type = type;
+    o.frequency.value = 440 * Math.pow(2, (midi - 69) / 12);
+    if (detune) o.detune.value = detune;
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g); g.connect(bus || this.sfxGain);
+    o.start(t); o.stop(t + dur + 0.02);
+    return o;
+  },
+  _noise(t, dur, vol, hp, bus) {
+    const s = this.ctx.createBufferSource(); s.buffer = this.noiseBuf;
+    const g = this.ctx.createGain(), f = this.ctx.createBiquadFilter();
+    f.type = hp ? 'highpass' : 'lowpass';
+    f.frequency.value = hp ? 5500 : 1800;
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    s.connect(f); f.connect(g); g.connect(bus || this.sfxGain);
+    s.start(t); s.stop(t + dur + 0.02);
+    return s;
+  },
+  _kick(t, bus) {
+    const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(150, t);
+    o.frequency.exponentialRampToValueAtTime(40, t + 0.1);
+    g.gain.setValueAtTime(0.5, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.13);
+    o.connect(g); g.connect(bus || this.sfxGain);
+    o.start(t); o.stop(t + 0.15);
+    return o;
+  },
+
+  play(key) {
+    this.want = key;
+    if (!this.ready()) return;
+    if (this.current === key) return;
+    this.stopMusic(true);
+    this.want = key;
+    if (key) this._startLoop(key);
+  },
+  _startLoop(key) {
+    this.current = key;
+    const run = () => {
+      if (this.current !== key || !this.ctx) return;
+      const dur = this._pass(SONGS[key], this.ctx.currentTime + 0.06);
+      this.loopTimer = setTimeout(run, (dur - 0.35) * 1000);
+    };
+    run();
+  },
+  _pass(song, t0) {
+    const step = 60 / song.bpm / 2, nodes = [];
+    const durOf = (arr, i) => { let d = 1; while (arr[i + d] === -1) d++; return d; };
+    for (let i = 0; i < 32; i++) {
+      const t = t0 + i * step + ((song.swing && i % 2) ? step * song.swing : 0);
+      const bn = song._bass[i] || 0, ln = song._lead[i] || 0;
+      if (bn > 0) nodes.push(this._tone(song.bassType, bn, t, step * durOf(song._bass, i) * 0.9, song.bassVol || 0.15, 0, this.musicGain));
+      if (ln > 0) nodes.push(this._tone(song.leadType, ln, t, step * durOf(song._lead, i) * 0.95 + 0.04, 0.085,
+        song.vib ? (i % 2 ? song.vib : -song.vib) : 0, this.musicGain));
+      const ch = song.drums[i];
+      if (ch === 'K') { nodes.push(this._kick(t, this.musicGain)); nodes.push(this._noise(t, 0.03, 0.04, true, this.musicGain)); }
+      else if (ch === 'S') { nodes.push(this._noise(t, 0.09, 0.2, false, this.musicGain)); }
+      else if (ch === 'h') { nodes.push(this._noise(t, 0.03, 0.04, true, this.musicGain)); }
+    }
+    this.passNodes.push(nodes);
+    if (this.passNodes.length > 3) this.passNodes.shift();
+    return 32 * step;
+  },
+  stopMusic(fade) {
+    if (this.loopTimer) { clearTimeout(this.loopTimer); this.loopTimer = null; }
+    this.current = null; this.want = null;
+    if (!this.ctx) return;
+    const kill = () => {
+      this.passNodes.forEach(ns => ns.forEach(n => { try { n.stop(); } catch (e) {} }));
+      this.passNodes = [];
+      this.musicGain.gain.setValueAtTime(0.7, this.ctx.currentTime);
+    };
+    if (fade) {
+      this.musicGain.gain.setTargetAtTime(0, this.ctx.currentTime, 0.08);
+      setTimeout(kill, 350);
+    } else kill();
+  },
+  jingle(key) {
+    if (!this.ready()) return;
+    const t = this.ctx.currentTime + 0.05;
+    if (key === 'death') {
+      [[69, 0], [64, 0.18], [60, 0.36], [57, 0.54]].forEach(p => {
+        this._tone('pulse', p[0], t + p[1], 0.4, 0.1);
+        this._tone('triangle', p[0] - 12, t + p[1], 0.4, 0.1);
+      });
+    } else if (key === 'fanfare') {
+      [[69, 0], [72, 0.11], [76, 0.22], [81, 0.33]].forEach(p => this._tone('pulse', p[0], t + p[1], 0.22, 0.11));
+      [81, 76, 72].forEach(m => this._tone('pulse', m, t + 0.46, 0.55, 0.07));
+      this._tone('triangle', 45, t + 0.46, 0.55, 0.13);
+    }
+  },
+
+  sfx: {
+    punch() { if (!AUDIO.ready()) return; const t = AUDIO.ctx.currentTime;
+      const o = AUDIO._tone('square', 81, t, 0.08, 0.14);
+      o.frequency.setValueAtTime(880, t); o.frequency.exponentialRampToValueAtTime(180, t + 0.07);
+      AUDIO._noise(t, 0.04, 0.08, true); },
+    kill(combo) { if (!AUDIO.ready()) return; const t = AUDIO.ctx.currentTime;
+      AUDIO._noise(t, 0.12, 0.2, false);
+      const o = AUDIO._tone('square', 60, t, 0.16, 0.12);
+      o.frequency.setValueAtTime(620, t); o.frequency.exponentialRampToValueAtTime(90, t + 0.15);
+      AUDIO._tone('pulse', 76 + Math.min(combo || 1, 12), t + 0.02, 0.14, 0.1); },
+    clank() { if (!AUDIO.ready()) return; const t = AUDIO.ctx.currentTime;
+      [1187, 1580].forEach(f => { const o = AUDIO._tone('square', 60, t, 0.16, 0.09); o.frequency.value = f; });
+      AUDIO._noise(t, 0.05, 0.1, true); },
+    swat() { if (!AUDIO.ready()) return; const t = AUDIO.ctx.currentTime;
+      const o = AUDIO._tone('square', 60, t, 0.07, 0.08);
+      o.frequency.setValueAtTime(300, t); o.frequency.exponentialRampToValueAtTime(1400, t + 0.06); },
+    boom() { if (!AUDIO.ready()) return; const t = AUDIO.ctx.currentTime;
+      AUDIO._noise(t, 0.45, 0.35, false);
+      const o = AUDIO._tone('sine', 40, t, 0.45, 0.45);
+      o.frequency.setValueAtTime(130, t); o.frequency.exponentialRampToValueAtTime(28, t + 0.4); },
+    zip() { if (!AUDIO.ready()) return; const t = AUDIO.ctx.currentTime;
+      const o = AUDIO._tone('triangle', 60, t, 0.14, 0.1);
+      o.frequency.setValueAtTime(1600, t); o.frequency.exponentialRampToValueAtTime(220, t + 0.13); },
+    door() { if (!AUDIO.ready()) return; const t = AUDIO.ctx.currentTime;
+      [[60, 0], [64, 0.07], [67, 0.14], [72, 0.21]].forEach(p => AUDIO._tone('pulse', p[0], t + p[1], 0.12, 0.08)); },
+    mimic() { if (!AUDIO.ready()) return; const t = AUDIO.ctx.currentTime;
+      [[58, 0], [64, 0.09]].forEach(p => AUDIO._tone('square', p[0], t + p[1], 0.16, 0.1));
+      AUDIO._noise(t + 0.05, 0.1, 0.08, true); },
+    pick() { if (!AUDIO.ready()) return; const t = AUDIO.ctx.currentTime;
+      [[69, 0], [76, 0.08]].forEach(p => AUDIO._tone('pulse', p[0], t + p[1], 0.14, 0.1)); },
+    blip() { if (!AUDIO.ready()) return; AUDIO._tone('pulse', 81, AUDIO.ctx.currentTime, 0.07, 0.09); },
+    playerDeath() { if (!AUDIO.ready()) return; const t = AUDIO.ctx.currentTime;
+      AUDIO._noise(t, 0.5, 0.4, false);
+      const o = AUDIO._tone('sine', 40, t, 0.5, 0.5);
+      o.frequency.setValueAtTime(160, t); o.frequency.exponentialRampToValueAtTime(24, t + 0.45);
+      const w = AUDIO._tone('square', 60, t + 0.05, 0.4, 0.08);
+      w.frequency.setValueAtTime(440, t + 0.05); w.frequency.exponentialRampToValueAtTime(55, t + 0.42); }
+  }
+};
+// first key/click/touch unlocks audio (browser autoplay rules); M mutes
+['keydown', 'pointerdown', 'touchstart'].forEach(ev =>
+  window.addEventListener(ev, (e) => {
+    AUDIO.unlock();
+    if (ev === 'keydown' && (e.key === 'm' || e.key === 'M')) AUDIO.toggleMute();
+  }, { passive: true }));
+
+/* ================================================================
+   SPRITE DATA 1/3 - the hero and the early roster
+   one char = one pixel. '.' = transparent. see PAL for colors.
+   ================================================================ */
+const HERO_IDLE = [
+'....######......',
+'..##ffffff##....',
+'.#ffffffffff#...',
+'.#fwwffffwwf#...',
+'.#fw#ffff#wf#...',
+'.#ffffffffff#...',
+'..#fff##fff#....',
+'...########.....',
+'..#yyyyyyyy#....',
+'.#yyyyyyyyyy#...',
+'.#yy#yyyy#yy#...',
+'#rr#yyyyyy#rr#..',
+'#rr#yy##yy#rr#..',
+'.##yyy##yyy##...',
+'..#rr#..#rr#....',
+'..###....###....'];
+const HERO_WALK0 = [
+'....######......',
+'..##ffffff##....',
+'.#ffffffffff#...',
+'.#fwwffffwwf#...',
+'.#fw#ffff#wf#...',
+'.#ffffffffff#...',
+'..#fff##fff#....',
+'...########.....',
+'..#yyyyyyyy#....',
+'.#yyyyyyyyyy#...',
+'.#yy#yyyy#yy#...',
+'#rr#yyyyyy#rr#..',
+'#rr#yy##yy#rr#..',
+'.##yyy##yyy##...',
+'.#rr#....#rr#...',
+'.###......###...'];
+const HERO_WALK1 = [
+'....######......',
+'..##ffffff##....',
+'.#ffffffffff#...',
+'.#fwwffffwwf#...',
+'.#fw#ffff#wf#...',
+'.#ffffffffff#...',
+'..#fff##fff#....',
+'...########.....',
+'..#yyyyyyyy#....',
+'.#yyyyyyyyyy#...',
+'.#yy#yyyy#yy#...',
+'#rr#yyyyyy#rr#..',
+'#rr#yy##yy#rr#..',
+'.##yyy##yyy##...',
+'...#rr##rr#.....',
+'...##....##.....'];
+const HERO_PUNCH = [
+'....######......',
+'..##ffffff##....',
+'.#ffffffffff#...',
+'.#fwwffffwwf#...',
+'.#fw#ffff#wf#...',
+'.#ffffffffff#...',
+'..#fff##fff#....',
+'...########.....',
+'..#yyyyyyyy#....',
+'.#yyyyyyyyyyyy#.',
+'#rr#yyyy#yyyrrr#',
+'#rr#yyyy#yyyrrr#',
+'.##yyy##yyy##...',
+'..#yyy##yyy#....',
+'..#rr#..#rr#....',
+'..###....###....'];
+
+// skeleton - the entry-level employee of every dungeon
+const SKEL = [
+'...########.....',
+'..#bbbbbbbb#....',
+'.#bbbbbbbbbb#...',
+'.#b###bb###b#...',
+'.#b#r#bb#r#b#...',
+'.#bbbbbbbbbb#...',
+'..#bb#bb#bb#....',
+'...#b#b#b#b#....',
+'....######......',
+'..#bBbbbbBb#....',
+'.#b#bBbbBb#b#...',
+'.#b.#bbbb#.b#...',
+'....#bBBb#......',
+'.....#bb#.......',
+'....#b##b#......',
+'....##..##......'];
+const SKEL_B = [
+'...########.....',
+'..#bbbbbbbb#....',
+'.#bbbbbbbbbb#...',
+'.#b###bb###b#...',
+'.#b#r#bb#r#b#...',
+'.#bbbbbbbbbb#...',
+'..#bb#bb#bb#....',
+'...#b#b#b#b#....',
+'....######......',
+'..#bBbbbbBb#....',
+'..#b#BbbB#b#....',
+'..#b#bbbb#b#....',
+'....#bBBb#......',
+'.....#bb#.......',
+'...#b#..#b#.....',
+'...##....##.....'];
+
+// imp - charges at you with the confidence of something taller
+const IMP = [
+'..##......##....',
+'..#h#....#h#....',
+'...#h####h#.....',
+'..##oooooo##....',
+'.#oooooooooo#...',
+'.#oww#oo#wwo#...',
+'.#oooooooooo#...',
+'..#oo####oo#....',
+'..#o#wwww#o#....',
+'...#oooooo#.....',
+'..#oOoooooO#....',
+'.#oo#oooo#oo#...',
+'.#o.#oOOo#.o#...',
+'....#oooo#......',
+'...#oo##oo#.....',
+'...##....##.....'];
+const IMP_B = [
+'..##......##....',
+'..#h#....#h#....',
+'...#h####h#.....',
+'..##oooooo##....',
+'.#oooooooooo#...',
+'.#oww#oo#wwo#...',
+'.#oooooooooo#...',
+'..#oo####oo#....',
+'..#o#wwww#o#....',
+'...#oooooo#.....',
+'..#oOoooooO#....',
+'..#o#oooo#o#....',
+'..#o#oOOo#o#....',
+'....#oooo#......',
+'..#oo#..#oo#....',
+'..##......##....'];
+
+// bat - has wings, no plan
+const BAT = [
+'..#..........#..',
+'.#u#........#u#.',
+'.#uu#..##..#uu#.',
+'#uuuu##UU##uuuu#',
+'#uUuuuUUUUuuuUu#',
+'.#u#wUUUUw#u#...',
+'..#.#UUUUUU#.#..',
+'....#UU##UU#....',
+'....#U#..#U#....',
+'.....#....#.....'];
+const BAT_B = [
+'....#......#....',
+'...#u#....#u#...',
+'..#uu##..##uu#..',
+'.#uuuU####Uuuu#.',
+'.#uUuUUUUUUuUu#.',
+'..#u#wUUUUw#u#..',
+'...##UUUUUU##...',
+'....#UU##UU#....',
+'....#U#..#U#....',
+'.....#....#.....'];
+
+// eye turret - blinks, judges, shoots
+const TURRET = [
+'....########....',
+'..##tttttttt##..',
+'.#tttttttttttt#.',
+'.#tt##wwww##tt#.',
+'#tt#wwwwwwww#tt#',
+'#t#wwwiiiiwww#t#',
+'#t#wwii##iiww#t#',
+'#t#wwii##iiww#t#',
+'#t#wwwiiiiwww#t#',
+'#tt#wwwwwwww#tt#',
+'.#tt##wwww##tt#.',
+'.#tttttttttttt#.',
+'..#TttttttttT#..',
+'..#TTTTTTTTTT#..',
+'.##T##....##T##.',
+'................'];
+const TURRET_B = [
+'....########....',
+'..##tttttttt##..',
+'.#tttttttttttt#.',
+'.#tt########tt#.',
+'#tt#tttttttt#tt#',
+'#t#tttttttttt#t#',
+'#t#tt######tt#t#',
+'#t#tt######tt#t#',
+'#t#tttttttttt#t#',
+'#tt#tttttttt#tt#',
+'.#tt########tt#.',
+'.#tttttttttttt#.',
+'..#TttttttttT#..',
+'..#TTTTTTTTTT#..',
+'.##T##....##T##.',
+'................'];
+
+// slime - punching it is a trap. a wet, green trap.
+const SLIME = [
+'................',
+'.....######.....',
+'...##gggggg##...',
+'..#ggnnggggggg#.',
+'.#ggnngggggggg#.',
+'.#gggg##gg##gg#.',
+'#ggggg##gg##ggg#',
+'#gggggggggggggg#',
+'#ggggg####ggggg#',
+'#GggggggggggggG#',
+'#GggggggggggggG#',
+'.#GGggggggggGG#.',
+'..##GGGGGGGG##..',
+'....########....',
+'...#G#..#G#.....',
+'...##...##......'];
+const SLIME_B = [
+'................',
+'................',
+'................',
+'....########....',
+'..##gggggggg##..',
+'.#ggnngggggggg#.',
+'#ggnngggggggggg#',
+'#ggg##gg##ggggg#',
+'#ggg##gg##ggggg#',
+'#ggggg####ggggg#',
+'#gggggggggggggg#',
+'#GggggggggggggG#',
+'.#GGggggggggGG#.',
+'..############..',
+'..#G#......#G#..',
+'..##........##..'];
+const SLIME_MINI = [
+'..######..',
+'.#gggggg#.',
+'#gg#gg#gg#',
+'#gggggggg#',
+'#gg####gg#',
+'#GggggggG#',
+'.#GGGGGG#.',
+'..######..'];
+
+// ghost - obstacles are a suggestion it declines
+const GHOST = [
+'.....######.....',
+'...##vvvvvv##...',
+'..#vvvvvvvvvv#..',
+'..#vvvvvvvvvv#..',
+'.#vv##vvvv##vv#.',
+'.#vv##vvvv##vv#.',
+'.#vvvvvvvvvvvv#.',
+'.#vvvv####vvvv#.',
+'.#vvvvvvvvvvvv#.',
+'.#vVvvvvvvvvVv#.',
+'.#vVvvvvvvvvVv#.',
+'.#vvvvvvvvvvvv#.',
+'.#vvv#vvvv#vvv#.',
+'..#v#.#vv#.#v#..',
+'...#...##...#...',
+'................'];
+const GHOST_B = [
+'.....######.....',
+'...##vvvvvv##...',
+'..#vvvvvvvvvv#..',
+'..#vvvvvvvvvv#..',
+'.#vv##vvvv##vv#.',
+'.#vv##vvvv##vv#.',
+'.#vvvvvvvvvvvv#.',
+'.#vvvv####vvvv#.',
+'.#vvvvvvvvvvvv#.',
+'.#vVvvvvvvvvVv#.',
+'.#vVvvvvvvvvVv#.',
+'.#vvvvvvvvvvvv#.',
+'.#vv#vvvv#vvvv#.',
+'..#v#.#v#..#v#..',
+'..#...##....#...',
+'................'];
+
+/* ================================================================
+   SPRITE DATA 2/3 - late roster + environment
+   ================================================================ */
+// shield knight - the shield is the conversation
+const KNIGHT = [
+'...########.....',
+'..#kkkkkkkk#....',
+'.#kkkkkkkkkk#...',
+'.#kk#kkkk#kk#...',
+'.#kkkkkkkkkk#...',
+'..#kkkkkkkk#....',
+'...########.....',
+'..#kkkkkk##ss#..',
+'.#kkkkkkkk#sS#..',
+'.#kKkkkkkk#sS#..',
+'.#kKkkkkkk#sS#..',
+'..#kkkkkk##ss#..',
+'...#KkkK#.#ss#..',
+'....#kk#........',
+'...#k##k#.......',
+'...##..##.......'];
+
+// bomber - punch it, then leave. quickly.
+const BOMBER = [
+'........z.......',
+'.......#z.......',
+'......#x#.......',
+'....##qqq##.....',
+'..##qqqqqqq##...',
+'.#qqqqqqqqqqq#..',
+'.#qqwwqqqwwqq#..',
+'#qqqwwqqqwwqqq#.',
+'#qqqqqqqqqqqqq#.',
+'#qqqqqq##qqqqq#.',
+'#qQqqqqqqqqqqQ#.',
+'.#qQqqqqqqqqQ#..',
+'..#qQQqqqqQQ#...',
+'...##QQQQQQ##...',
+'.....######.....',
+'................'];
+
+// summoner - hr department of the dungeon
+const SUMMONER = [
+'.....######.....',
+'....#mmmmmm#....',
+'...#mmmmmmmm#...',
+'...#mm####mm#...',
+'...#m#xxxx#m#...',
+'...#m#r##r#m#...',
+'...#mm#xx#mm#...',
+'..#mmmmmmmmmm#..',
+'..#mMmmmmmmMm#..',
+'.#m#mmmmmmmm#m#.',
+'.#m#mMmmmmMm#m#.',
+'#rr#mMmmmmMm#rr#',
+'#rr#mmmmmmmm#rr#',
+'.##mMMmmmmMM##..',
+'..#MMMMMMMMMM#..',
+'..############..'];
+
+// sniper - one eye, zero chill
+const SNIPER = [
+'....########....',
+'...#cccccccc#...',
+'..#cccccccccc#..',
+'..#cc##ww##cc#..',
+'..#cc#wwww#cc#..',
+'..#cc#w##w#cc#..',
+'..#cc##ww##cc#..',
+'..#cccccccccc#..',
+'...#cCccccCc#...',
+'..#c#cccccc#c#..',
+'..#c#cCccCc#c#..',
+'..#c#cccccc#c#..',
+'....#cCCCCc#....',
+'....#cc##cc#....',
+'...#cc#..#cc#...',
+'...##......##...'];
+
+// chest - 95% furniture, 5% regret (doubles as the obstacle block)
+const CHEST = [
+'..############..',
+'.#444444444444#.',
+'#44333333333344#',
+'#43333333333334#',
+'################',
+'#33333#dd#33333#',
+'#33333#dd#33333#',
+'#33333333333333#',
+'#32222222222223#',
+'#22222222222222#',
+'.##############.',
+'..##........##..',
+'................'];
+// the 5%
+const MIMIC_REV = [
+'..############..',
+'.#444444444444#.',
+'#44333333333344#',
+'#xx#r#xxxx#r#xx#',
+'#xxxxxxxxxxxxxx#',
+'#wxwxwxwxwxwxwx#',
+'#xxxx#rrrr#xxxx#',
+'#xwxwxwxwxwxwxx#',
+'#32222222222223#',
+'#22222222222222#',
+'.##############.',
+'..##........##..',
+'................'];
+
+// pillar - load-bearing ambience
+const PILLAR = [
+'..############..',
+'.#444444444444#.',
+'..#3333333333#..',
+'...#33333333#...',
+'...#43333334#...',
+'...#43333334#...',
+'...#43#33334#...',
+'...#43333334#...',
+'...#43333334#...',
+'...#43333334#...',
+'...#43333#34#...',
+'...#43333334#...',
+'...#43333334#...',
+'...#43333334#...',
+'...#43#33334#...',
+'...#43333334#...',
+'...#43333334#...',
+'...#43333334#...',
+'...#43333334#...',
+'...#33333333#...',
+'..#3333333333#..',
+'.#444444444444#.',
+'..############..',
+'................'];
+
+// torch - two frames of fire doing its best
+const TORCH_0 = [
+'........',
+'...aa...',
+'..aaaa..',
+'..awwa..',
+'.aawwaa.',
+'.aaaaaa.',
+'..#dd#..',
+'...dd...',
+'...dd...',
+'..#33#..',
+'..3333..',
+'........'];
+const TORCH_1 = [
+'...a....',
+'..aa....',
+'..aaaa..',
+'..awwa..',
+'.aawwa..',
+'.aaaaa..',
+'..#dd#..',
+'...dd...',
+'...dd...',
+'..#33#..',
+'..3333..',
+'........'];
+
+// door - the only exit, emotionally and literally
+const DOOR_C = [
+'....############....',
+'..##333333333333##..',
+'.#3333333333333333#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xdxxdxxdxxdx33#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#3333333333333333#.',
+'..################..',
+'....................'];
+const DOOR_O = [
+'....############....',
+'..##333333333333##..',
+'.#3333333333333333#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#33xxxxxaxxxxxx33#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#33xxaxxxxxxaxx33#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#33xxxxxxaxxxxx33#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#33xaxxxxxxxxxx33#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#33xxxxxxxxaxxx33#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#33xxxxaxxxxxxx33#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#33xxxxxxxxxxxx33#.',
+'.#3333333333333333#.',
+'..################..',
+'....................'];
+
+// floor decals
+const BONES = [
+'..##....##....',
+'.#bb#..#bb#...',
+'..#bb##bb#....',
+'...#bbbb#.....',
+'....####......',
+'..............'];
+const CRACK = [
+'x...........',
+'xx..........',
+'.xx.........',
+'..xx.x......',
+'...xxx......',
+'....xx......',
+'....x.xx....',
+'.......xx...',
+'........x...',
+'............'];
+
+// floor tile + wall brick (drawn per-theme with env tones)
+const FLOOR_T = [
+'2222222222222222',
+'2111111111111111',
+'2111111111111111',
+'2111111111111111',
+'2111121111111111',
+'2111111111111111',
+'2111111111111111',
+'2111111111111111',
+'2111111111111111',
+'2111111111112111',
+'2111111111111111',
+'2111111111111111',
+'2111111111111111',
+'2112111111111111',
+'2111111111111111',
+'2111111111111111'];
+const WALL_T = [
+'2222222222222222',
+'4444444424444444',
+'3333333323333333',
+'3333333323333333',
+'2222222222222222',
+'4442444444442444',
+'3332333333332333',
+'3332333333332333',
+'2222222222222222',
+'4444444424444444',
+'3333333323333333',
+'3333333323333333',
+'2222222222222222',
+'4442444444442444',
+'3332333333332333',
+'3332333333332333'];
+
+// projectiles
+const BOLT = [
+'.######.',
+'#EeeeeE#',
+'#eewwee#',
+'#ewwwwe#',
+'#ewwwwe#',
+'#eewwee#',
+'#EeeeeE#',
+'.######.'];
+const SBOLT = [
+'.##########.',
+'#wwwwwwwccc#',
+'#cccwwwwwww#',
+'.##########.'];
+const BBOLT = [
+'..######..',
+'.#dddddd#.',
+'#ddDDDDdd#',
+'#dDwwwwDd#',
+'#dDwwwwDd#',
+'#dDwwwwDd#',
+'#dDwwwwDd#',
+'#ddDDDDdd#',
+'.#dddddd#.',
+'..######..'];
+
+/* ================================================================
+   SPRITE DATA 3/3 - the bosses
+   ================================================================ */
+const GEAR = [
+'..........####..........',
+'..........#dd#..........',
+'......##..#dd#..##......',
+'.....#dd###dd###dd#.....',
+'....#dddddddddddddd#....',
+'....#dDdddddddddDdd#....',
+'..###dddddddddddddd###..',
+'..#dddd##dddddd##dddd#..',
+'..#ddd#xx#dddd#xx#ddd#..',
+'..#ddd#xx#dddd#xx#ddd#..',
+'.##dddddddddddddddddd##.',
+'.#dddddddddddddddddddd#.',
+'.#dddddd########dddddd#.',
+'.#ddddd#wwwwwwww#ddddd#.',
+'.##dddd##########dddd##.',
+'..#ddddddddddddddddDd#..',
+'..###ddDDDDDDDDDDdd###..',
+'.....#dd###dd###dd#.....',
+'......##..#dd#..##......',
+'..........#dd#..........',
+'..........####..........',
+'........................',
+'........................',
+'........................'];
+const WARDEN = [
+'....#....##....#....',
+'...##d..####..d##...',
+'..#dddd#dddd#dddd#..',
+'..#ddrdddrrdddrdd#..',
+'..#DDDDDDDDDDDDDD#..',
+'.#dddddddddddddddd#.',
+'#dddddddddddddddddd#',
+'#dd##dddddddddd##dd#',
+'#d#rr#dddddddd#rr#d#',
+'#d#rr#dddddddd#rr#d#',
+'#dddddddddddddddddd#',
+'#ddddddd####ddddddd#',
+'#dddddddddddddddddd#',
+'#dd##############dd#',
+'#dd#w#w#w#w#w#w##dd#',
+'#ddD############Ddd#',
+'.#dDDddddddddDDddd#.',
+'.#dddddddddddddddd#.',
+'..#DDDDDDDDDDDDDD#..',
+'...##############...'];
+const MINO = [
+'.##..................##.',
+'#bb#................#bb#',
+'#bbb#..............#bbb#',
+'.#bbb#...######...#bbb#.',
+'..#bbb##OOOOOOOO##bbb#..',
+'...#bb#OOOOOOOOOO#bb#...',
+'....###OOOOOOOOOO###....',
+'....#OOO##OOOO##OOO#....',
+'....#OO#rr#OO#rr#OO#....',
+'....#OOOOOOOOOOOOOO#....',
+'....#OOOOOOOOOOOOOO#....',
+'...#OOOOOOOOOOOOOOOO#...',
+'...#OOO#OOOOOOOO#OOO#...',
+'...#OO#oooooooooo#OO#...',
+'...#OO#oxx#oo#xxo#OO#...',
+'...#OO#oooo##oooo#OO#...',
+'....#O#ooo#dd#ooo#O#....',
+'....#O##oo#dd#oo##O#....',
+'.....##.#oooooo#.##.....',
+'........########........',
+'........................',
+'........................',
+'........................',
+'........................'];
+const SKING = [
+'.......d..dd..d.........',
+'.......dd.dd.dd.........',
+'.......dddddddd.........',
+'......############......',
+'....##gggggggggggg##....',
+'...#ggnnngggggggggg#....',
+'..#ggnnnggggggggggggg#..',
+'..#ggnngggggggggggggg#..',
+'.#ggggg###gggg###ggggg#.',
+'#gggggg#r#gggg#r#gggggg#',
+'#gggggggggggggggggggggg#',
+'#gggggggggggggggggggggg#',
+'#ggggggg########ggggggg#',
+'#gggggg#xxxxxxxx#gggggg#',
+'#GgggggggggggggggggggG#.',
+'#GgggggggggggggggggggG#.',
+'.#GGgggggggggggggggGG#..',
+'..##GGGGGGGGGGGGGGGG##..',
+'....################....',
+'...#G#...#GG#....#G#....',
+'...##.....##......##....',
+'........................',
+'........................',
+'........................'];
+const QUEEN = [
+'.......d..dd..d.........',
+'.......dd.dd.dd.........',
+'.......dddddddd.........',
+'......#mmmmmmmm#........',
+'.....#mmmmmmmmmm#.......',
+'.....#mm######mm#.......',
+'.....#m#xxxxxx#m#.......',
+'.....#m#r#xx#r#m#.......',
+'.....#m#xxxxxx#m#.......',
+'.....#mmm#xx#mmm#.......',
+'....#mmmmmmmmmmmm#......',
+'....#mMmmmmmmmmMm#......',
+'...#mm#mmmmmmmm#mm#.....',
+'..#mm#mMmmmmmmMm#mm#....',
+'.#rr#mMmmmmmmmmMm#rr#...',
+'.#rr#mmmmmmmmmmmm#rr#...',
+'..##mmMMmmmmmmMMmm##....',
+'...#mmmmmmmmmmmmmm#.....',
+'...#mMMmmmmmmmmMMm#.....',
+'...#mmmmmmmmmmmmmm#.....',
+'..#MMMMMMMMMMMMMMMM#....',
+'..##################....',
+'........................',
+'........................'];
+const CUST = [
+'....################....',
+'...#dddddddddddddddd#...',
+'..#dddddddddddddddddd#..',
+'..#dDddddddddddddddDd#..',
+'..#dd##dddddddddd##dd#..',
+'..#dd#xx#dddddd#xx#dd#..',
+'..#dd#xx#dddddd#xx#dd#..',
+'..#dddddddddddddddddd#..',
+'..#ddd####dddd####ddd#..',
+'..#dddddddddddddddddd#..',
+'..#dDdddddddddddddDdd#..',
+'..#dddddddddddddddddd#..',
+'..####################..',
+'..#DDDDDDDDDDDDDDDDDD#..',
+'..####################..',
+'..#w#w#w#w#w#w#w#w#w#...',
+'..#w#w#w#w#w#w#w#w#w#...',
+'...#.#.#.#.#.#.#.#.#....',
+'........................',
+'........................',
+'........................',
+'........................',
+'........................',
+'........................'];
+const ORB = [
+'........########........',
+'......##dddddddd##......',
+'.....#dddddddddddd#.....',
+'....#ddDDddddddDDdd#....',
+'...#dD#wwwwwwwwww#Dd#...',
+'..#dD#wwwwwwwwwwww#Dd#..',
+'..#d#wwwwwiiiiwwwww#d#..',
+'.#dD#wwwwiiiiiiwwww#Dd#.',
+'.#d#wwwwiii##iiiwwww#d#.',
+'.#d#wwwwii####iiwwww#d#.',
+'.#d#wwwwii####iiwwww#d#.',
+'.#d#wwwwiii##iiiwwww#d#.',
+'.#dD#wwwwiiiiiiwwww#Dd#.',
+'..#d#wwwwwiiiiwwwww#d#..',
+'..#dD#wwwwwwwwwwww#Dd#..',
+'...#dD#wwwwwwwwww#Dd#...',
+'....#ddDDddddddDDdd#....',
+'.....#dddddddddddd#.....',
+'......##dddddddd##......',
+'........########........',
+'........................',
+'........................',
+'........................',
+'........................'];
+
+// ---------------- family registry ----------------
+const ENEMY_FAMS = {
+  skel:     { f0: SKEL,       f1: SKEL_B,                  tint: 'b', body: [13, 13] },
+  imp:      { f0: IMP,        f1: IMP_B,                   tint: 'o', body: [12, 12] },
+  bat:      { f0: BAT,        f1: BAT_B,                   tint: 'u', body: [12, 8]  },
+  turret:   { f0: TURRET,     f1: TURRET_B,                tint: 't', body: [14, 14] },
+  slime:    { f0: SLIME,      f1: SLIME_B,                 tint: 'g', body: [14, 11] },
+  mini:     { f0: SLIME_MINI, f1: mirrorRows(SLIME_MINI),  tint: 'g', body: [8, 7]   },
+  ghost:    { f0: GHOST,      f1: GHOST_B,                 tint: 'v', body: [12, 12] },
+  knight:   { f0: KNIGHT,     f1: shiftUpRows(KNIGHT),     tint: 'k', body: [12, 13] },
+  bomber:   { f0: BOMBER,     f1: shiftUpRows(BOMBER),     tint: 'q', body: [13, 11] },
+  summoner: { f0: SUMMONER,   f1: shiftUpRows(SUMMONER),   tint: 'm', body: [12, 14] },
+  sniper:   { f0: SNIPER,     f1: shiftUpRows(SNIPER),     tint: 'c', body: [12, 14] },
+  mimic:    { f0: MIMIC_REV,  f1: shiftUpRows(MIMIC_REV),  tint: 'd', body: [14, 11] }
+};
+function tintFor(fam, themeI) {
+  const pal = withOver(PAL, THEMES[themeI].over);
+  const v = pal[(ENEMY_FAMS[fam] || { tint: 'd' }).tint];
+  return Array.isArray(v) ? v[0] : v;
+}
+
+/* ================================================================
+   BOOT SCENE - bake ~340 textures from the matrices above
+   ================================================================ */
+class BootScene extends Phaser.Scene {
+  constructor() { super('Boot'); }
+  create() {
+    // 4x4 white pixel for particles and flashes
+    const g = this.make.graphics({ add: false });
+    g.fillStyle(0xffffff, 1); g.fillRect(0, 0, 4, 4);
+    g.generateTexture('pix', 4, 4); g.destroy();
+
+    // the hero (never themed - heroes are consistent, it is their whole thing)
+    makePix(this, 'hero_idle', HERO_IDLE, PAL);
+    makePix(this, 'hero_walk_0', HERO_WALK0, PAL);
+    makePix(this, 'hero_walk_1', shiftUpRows(HERO_WALK1), PAL);
+    makePix(this, 'hero_punch', HERO_PUNCH, PAL);
+
+    // shoticus rex: the hero's palette after several bad decisions
+    const rexPal = withOver(PAL, { f: 0x6a6a7a, F: 0x4a4a58, y: 0x3a3a4a, Y: 0x23232e, r: 0xb01030, w: 0xff5060, p: 0x15121f });
+    makePix(this, 'boss_rex_0', HERO_IDLE, rexPal);
+    makePix(this, 'boss_rex_1', HERO_WALK0, rexPal);
+    makePix(this, 'boss_rex_p', HERO_PUNCH, rexPal);
+
+    // every enemy family x every theme x normal/elite x 2 frames
+    for (let t = 0; t < THEMES.length; t++) {
+      const pal = withOver(PAL, THEMES[t].over);
+      const epal = elitePal(pal);
+      for (const fam in ENEMY_FAMS) {
+        const F = ENEMY_FAMS[fam];
+        makePix(this, fam + '_' + t + '_0', F.f0, pal);
+        makePix(this, fam + '_' + t + '_1', F.f1, pal);
+        const w = Math.max.apply(null, F.f0.map(r => r.length));
+        const stamp = { rows: CROWN.rows, pal: CROWN.pal, ox: Math.floor((w - 8) / 2), oy: 0 };
+        makePix(this, fam + '_' + t + '_e_0', F.f0, epal, stamp);
+        makePix(this, fam + '_' + t + '_e_1', F.f1, epal, stamp);
+      }
+      // environment set for this theme
+      const env = withOver(PAL, {
+        1: THEMES[t].env[1], 2: THEMES[t].env[2], 3: THEMES[t].env[3], 4: THEMES[t].env[4], a: THEMES[t].env.a
+      });
+      makePix(this, 'floor_' + t, FLOOR_T, env);
+      makePix(this, 'wall_' + t, WALL_T, env);
+      makePix(this, 'chest_' + t, CHEST, env);
+      makePix(this, 'pillar_' + t, PILLAR, env);
+      makePix(this, 'torch_' + t + '_0', TORCH_0, env);
+      makePix(this, 'torch_' + t + '_1', TORCH_1, env);
+      makePix(this, 'door_' + t + '_c', DOOR_C, env);
+      makePix(this, 'door_' + t + '_o', DOOR_O, env);
+      makePix(this, 'bones_' + t, BONES, withOver(env, { b: THEMES[t].env[4] }));
+      makePix(this, 'crack_' + t, CRACK, { x: t === 3 ? 0x802818 : 0x08080e });
+    }
+
+    // the other six bosses (bosses stay gold - union rules)
+    makePix(this, 'boss_gear_0', GEAR, PAL);   makePix(this, 'boss_gear_1', mirrorRows(GEAR), PAL);
+    makePix(this, 'boss_warden_0', WARDEN, PAL); makePix(this, 'boss_warden_1', shiftUpRows(WARDEN), PAL);
+    makePix(this, 'boss_mino_0', MINO, PAL);   makePix(this, 'boss_mino_1', shiftUpRows(MINO), PAL);
+    makePix(this, 'boss_sking_0', SKING, PAL); makePix(this, 'boss_sking_1', shiftUpRows(SKING), PAL);
+    makePix(this, 'boss_queen_0', QUEEN, PAL); makePix(this, 'boss_queen_1', shiftUpRows(QUEEN), PAL);
+    makePix(this, 'boss_cust_0', CUST, PAL);   makePix(this, 'boss_cust_1', shiftUpRows(CUST), PAL);
+    makePix(this, 'boss_orb_0', ORB, PAL);     makePix(this, 'boss_orb_1', shiftUpRows(ORB), PAL);
+
+    // projectiles
+    makePix(this, 'bolt', BOLT, PAL);
+    makePix(this, 'sbolt', SBOLT, PAL);
+    makePix(this, 'bbolt', BBOLT, PAL);
+
+    // wait briefly for the pixel font, then go
+    let started = false;
+    const go = () => { if (!started) { started = true; this.scene.start('Title'); } };
+    if (document.fonts && document.fonts.load) {
+      document.fonts.load('16px "Press Start 2P"').then(go, go);
+      this.time.delayedCall(1500, go);
+    } else { go(); }
+  }
+}
+
+/* ================================================================
+   TITLE SCENE
+   ================================================================ */
+class TitleScene extends Phaser.Scene {
+  constructor() { super('Title'); }
+
+  create() {
+    AUDIO.play('title');
+    // drifting themed enemies in the background, for menace
+    this.decor = [];
+    const fams = ['skel', 'imp', 'bat', 'turret', 'slime', 'ghost', 'knight', 'summoner'];
+    for (let i = 0; i < 12; i++) {
+      const fam = Phaser.Utils.Array.GetRandom(fams);
+      const t = Phaser.Math.Between(0, THEMES.length - 1);
+      const s = this.add.image(
+        Phaser.Math.Between(40, W - 40), Phaser.Math.Between(40, H - 40),
+        fam + '_' + t + '_0'
+      ).setAlpha(0.18).setScale(2);
+      s.texBase = fam + '_' + t + '_';
+      s.vx = Phaser.Math.FloatBetween(-26, 26);
+      s.vy = Phaser.Math.FloatBetween(-26, 26);
+      this.decor.push(s);
+    }
+
+    ptext(this, W / 2 + 4, 152, 'ONE SHOTICUS', 34, '#8a6d1f');
+    const logo = ptext(this, W / 2, 148, 'ONE SHOTICUS', 34, '#ffe66d');
+    this.tweens.add({ targets: logo, y: 144, yoyo: true, repeat: -1, duration: 1200, ease: 'Sine.easeInOut' });
+
+    this.subIdx = Phaser.Math.Between(0, SUBTITLES.length - 1);
+    this.sub = ptext(this, W / 2, 212, SUBTITLES[this.subIdx], 10, '#9a9ab0');
+    this.time.addEvent({ delay: 2800, loop: true, callback: () => {
+      this.subIdx = (this.subIdx + 1) % SUBTITLES.length;
+      this.sub.setText(SUBTITLES[this.subIdx]);
+    }});
+
+    // the man himself
+    const hero = this.add.image(W / 2, 330, 'hero_idle').setScale(5);
+    this.tweens.add({ targets: hero, y: 324, yoyo: true, repeat: -1, duration: 900, ease: 'Sine.easeInOut' });
+
+    if (SAVE.bestFloor > 0) {
+      ptext(this, W / 2, 262, 'BEST RUN: FLOOR ' + SAVE.bestFloor + ' / ' + SAVE.bestScore + ' PTS', 10, '#ffd23f');
+    }
+
+    const prompt = ptext(this, W / 2, 432, 'PRESS SPACE TO START', 14, '#2ecc71');
+    this.tweens.add({ targets: prompt, alpha: 0.25, yoyo: true, repeat: -1, duration: 500 });
+    ptext(this, W / 2, 478, 'WASD/ARROWS MOVE   SPACE/CLICK PUNCH   M MUTE', 8, '#777788');
+    ptext(this, W / 2, 565, 'a game about commitment issues', 8, '#55556a').setAlpha(0.7);
+
+    let begun = false;
+    const begin = () => { if (!begun) { begun = true; AUDIO.sfx.blip(); RUN.reset(); this.scene.start('Game'); } };
+    this.input.keyboard.on('keydown-SPACE', begin);
+    this.input.on('pointerdown', begin);
+  }
+
+  update(time, delta) {
+    const dt = delta / 1000, f = Math.floor(time / 320) % 2;
+    for (const s of this.decor) {
+      s.x += s.vx * dt; s.y += s.vy * dt;
+      s.setTexture(s.texBase + f);
+      if (s.x < -20) s.x = W + 20; if (s.x > W + 20) s.x = -20;
+      if (s.y < -20) s.y = H + 20; if (s.y > H + 20) s.y = -20;
+    }
+  }
+}
+
+/* ================================================================
+   ROOM BUILDING - floor, walls, torches, decals, obstacle clusters
+   everything world-space gets tagW'd so the UI camera ignores it
+   ================================================================ */
+function buildRoom(scene) {
+  const t = scene.themeI, RW = scene.RW, RH = scene.RH;
+  tagW(scene, scene.add.tileSprite(0, 0, RW, RH, 'floor_' + t).setOrigin(0, 0).setDepth(0));
+  // wall ring (24px thick)
+  const wt = 24;
+  tagW(scene, scene.add.tileSprite(-wt, -wt, RW + wt * 2, wt, 'wall_' + t).setOrigin(0, 0).setDepth(2));
+  tagW(scene, scene.add.tileSprite(-wt, RH, RW + wt * 2, wt, 'wall_' + t).setOrigin(0, 0).setDepth(2));
+  tagW(scene, scene.add.tileSprite(-wt, 0, wt, RH, 'wall_' + t).setOrigin(0, 0).setDepth(2));
+  tagW(scene, scene.add.tileSprite(RW, 0, wt, RH, 'wall_' + t).setOrigin(0, 0).setDepth(2));
+  // torches along the top wall, with a soft pool of light
+  scene.torches = [];
+  for (let x = 90; x < RW - 60; x += 190) {
+    const tor = tagW(scene, scene.add.image(x, -10, 'torch_' + t + '_0').setScale(2).setDepth(3));
+    scene.torches.push(tor);
+    tagW(scene, scene.add.circle(x, 6, 42, THEMES[t].env.a, 0.05).setDepth(1));
+  }
+  // floor decals
+  const nDec = Math.floor((RW * RH) / 90000);
+  for (let i = 0; i < nDec; i++) {
+    const key = Math.random() < 0.5 ? 'bones_' + t : 'crack_' + t;
+    tagW(scene, scene.add.image(
+      Phaser.Math.Between(40, RW - 40), Phaser.Math.Between(40, RH - 40), key
+    ).setAlpha(0.8).setDepth(1).setFlipX(Math.random() < 0.5));
+  }
+}
+
+// chests and pillars in little clusters; floor 11+ may hide a mimic
+function spawnObstacleClusters(scene) {
+  if (scene.isBossRoom) return;
+  const t = scene.themeI, RW = scene.RW, RH = scene.RH;
+  const door = { x: RW, y: RH / 2 };
+  const nClusters = Phaser.Math.Between(4, 7);
+  const origins = [];
+  let tries = 0;
+  scene.mimicSpot = null;
+  const wantMimic = RUN.floor >= 11 && Math.random() < 0.3;
+  while (origins.length < nClusters && tries < 150) {
+    tries++;
+    const x = Phaser.Math.Between(70, RW - 70), y = Phaser.Math.Between(60, RH - 60);
+    if (Phaser.Math.Distance.Between(x, y, scene.player.x, scene.player.y) < 130) continue;
+    if (Phaser.Math.Distance.Between(x, y, door.x, door.y) < 130) continue;
+    if (origins.some(o => Phaser.Math.Distance.Between(x, y, o.x, o.y) < 110)) continue;
+    origins.push({ x, y });
+    // 1-3 blocks per cluster, snapped side by side
+    const n = Phaser.Math.Between(1, 3);
+    for (let i = 0; i < n; i++) {
+      const bx = x + i * 17 * (Math.random() < 0.5 ? 1 : -1) * (i > 0 ? 1 : 0);
+      const by = y + (i === 2 ? 14 : 0);
+      if (wantMimic && !scene.mimicSpot && origins.length > 1 && i === n - 1) {
+        scene.mimicSpot = { x: bx, y: by };   // an enemy in furniture cosplay
+        continue;
+      }
+      if (Math.random() < 0.22) {
+        const p = scene.obstacles.create(bx, by - 8, 'pillar_' + t);
+        tagW(scene, p).setDepth(4);
+        p.body.setSize(13, 12); p.body.setOffset(1, 10);
+      } else {
+        tagW(scene, scene.obstacles.create(bx, by, 'chest_' + t)).setDepth(3);
+      }
+    }
+  }
+}
+
+function findSpawnPos(scene, minPlayerDist) {
+  for (let i = 0; i < 70; i++) {
+    const x = Phaser.Math.Between(30, scene.RW - 30);
+    const y = Phaser.Math.Between(30, scene.RH - 30);
+    if (Phaser.Math.Distance.Between(x, y, scene.player.x, scene.player.y) < minPlayerDist) continue;
+    let clear = true;
+    scene.obstacles.getChildren().forEach(o => { if (Phaser.Math.Distance.Between(x, y, o.x, o.y) < 44) clear = false; });
+    if (clear) return { x, y };
+  }
+  return { x: scene.RW - 70, y: 70 };
+}
+
+/* ================================================================
+   ENEMY SPAWNING - one function configures every family
+   ================================================================ */
+function spawnEnemy(scene, fam, x, y, opts) {
+  opts = opts || {};
+  const t = scene.themeI;
+  const elite = !!opts.elite;
+  const texBase = fam + '_' + t + (elite ? '_e' : '') + '_';
+  const e = scene.enemies.create(x, y, texBase + '0');
+  tagW(scene, e).setDepth(5);
+  e.fam = fam; e.texBase = texBase; e.elite = elite;
+  e.dead = false; e.seed = Math.random() * 1000; e.frame_ = 0;
+  e.setCollideWorldBounds(true);
+  const bs = ENEMY_FAMS[fam].body;
+  e.body.setSize(bs[0], bs[1]);
+  const sm = enemySlowMult() * (elite ? 1.35 : 1);
+  const f = RUN.floor, now = nowMs(scene);
+  if (fam === 'skel') {
+    e.speed = (54 + f * 6) * sm;
+  } else if (fam === 'imp') {
+    e.speed = (255 + f * 12) * sm;
+    e.aiState = 'wait';
+    e.stateUntil = scene.spawnStart + graceTime() + Phaser.Math.Between(400, 1100);
+    e.chargeDir = { x: 0, y: 0 };
+    e.chainLeft = 0;
+  } else if (fam === 'bat') {
+    e.speed = (112 + f * 10) * sm;
+    e.setBounce(1, 1);
+    e.dir = Math.random() * Math.PI * 2;
+  } else if (fam === 'turret') {
+    e.body.moves = false;
+    e.nextShot = scene.spawnStart + graceTime() + Phaser.Math.Between(900, 1900);
+    e.telegraphed = false;
+  } else if (fam === 'slime') {
+    e.speed = (48 + f * 5) * sm;
+  } else if (fam === 'mini') {
+    e.speed = (95 + f * 6) * sm;
+    e.harmlessUntil = now + 350;
+  } else if (fam === 'ghost') {
+    e.speed = (40 + f * 3) * sm;
+    e.ghost = true;            // obstacle collider skips these
+    e.setDepth(6);             // floats above the furniture it ignores
+  } else if (fam === 'knight') {
+    e.speed = (58 + f * 5) * sm;
+    e.faceVec = { x: 1, y: 0 };
+    e.stunnedUntil = 0;
+  } else if (fam === 'bomber') {
+    e.speed = (66 + f * 5) * sm;
+  } else if (fam === 'summoner') {
+    e.body.moves = false;
+    e.phase = 'idle';
+    e.phaseUntil = scene.spawnStart + graceTime() + Phaser.Math.Between(1200, 2200);
+  } else if (fam === 'sniper') {
+    e.body.moves = false;
+    e.phase = 'aim';
+    e.phaseUntil = scene.spawnStart + graceTime() + 900 * telegraphMult();
+    e.laser = tagW(scene, scene.add.graphics()).setDepth(4);
+  } else if (fam === 'mimic') {
+    e.body.moves = false;
+    e.disguised = true;
+    e.setTexture('chest_' + t);   // furniture until proven otherwise
+    e.aiState = 'pause'; e.stateUntil = 0;
+    e.speed = (150 + f * 6) * sm;
+  }
+  return e;
+}
+
+function fireProjectile(scene, x, y, angle, speed, tex) {
+  const p = scene.projectiles.create(x, y, tex || 'bolt');
+  tagW(scene, p).setDepth(6);
+  p.body.setCircle(3, 1, 1);
+  p.setVelocity(Math.cos(angle) * speed, Math.sin(angle) * speed);
+  return p;
+}
+function countSummoned(scene) {
+  let n = 0;
+  scene.enemies.getChildren().forEach(e => { if (e.active && e.summoned) n++; });
+  return n;
+}
+
+/* ================================================================
+   HUD (screen-space, drawn only by the UI camera)
+   ================================================================ */
+function buildHUD(scene) {
+  scene.hudL = tagU(scene, scene.add.text(14, 14, '', hudStyle()).setOrigin(0).setDepth(20));
+  scene.hudR = tagU(scene, scene.add.text(W - 14, 14,
+    THEMES[scene.themeI].name + '\nBEST  F' + SAVE.bestFloor + ' / ' + SAVE.bestScore,
+    Object.assign(hudStyle(), { align: 'right' })).setOrigin(1, 0).setDepth(20));
+  scene.comboText = tagU(scene, ptext(scene, W / 2, 64, '', 13, '#ffe66d')).setDepth(20).setAlpha(0);
+  updateHUD(scene);
+  if (RUN.floor === 1 && RUN.room === 1) {
+    tagU(scene, scene.add.text(W / 2, H - 20, 'WASD/ARROWS MOVE      SPACE/CLICK PUNCH',
+      { fontFamily: FONT, fontSize: '8px', color: '#777788' }).setOrigin(0.5).setAlpha(0.7).setDepth(20));
+  }
+}
+function updateHUD(scene) {
+  const roomLabel = scene.isBossRoom ? 'BOSS' : RUN.room + '/' + ROOMS_PER_FLOOR;
+  scene.hudL.setText('FLOOR ' + RUN.floor + '  ROOM ' + roomLabel + '\nSCORE ' + RUN.score);
+}
+function addScore(scene, v, x, y) {
+  RUN.score += v;
+  updateHUD(scene);
+  floatText(scene, x, y, '+' + v, '#ffe66d');
+}
+
+/* ================================================================
+   ENEMY AI - one brain tick per enemy per frame
+   ================================================================ */
+function updateEnemy(scene, e, time, delta, frozen) {
+  const P = scene.player;
+  // mimics in disguise are furniture: no flicker, no thoughts
+  if (e.fam === 'mimic' && e.disguised) {
+    if (!frozen && Phaser.Math.Distance.Between(e.x, e.y, P.x, P.y) < 78) {
+      e.disguised = false;
+      e.setTexture(e.texBase + '0');
+      e.body.moves = true;
+      e.harmlessUntil = time + 450;
+      e.aiState = 'pause'; e.stateUntil = time + 500;
+      floatText(scene, e.x, e.y - 18, '!', '#ff4040');
+      AUDIO.sfx.mimic();
+      scene.tweens.add({ targets: e, y: e.y - 8, yoyo: true, duration: 110, repeat: 1 });
+    }
+    return;
+  }
+  if (frozen) {
+    if (e.body) e.setVelocity(0, 0);
+    e.setAlpha(0.45 + 0.35 * Math.sin(time / 55 + e.seed));
+    return;
+  }
+  if (!e.awake) { e.setAlpha(1); e.awake = true; }
+
+  // 2-frame walk animation + face the player
+  const fr = Math.floor(time / 250) % 2;
+  if (e.frame_ !== fr) { e.frame_ = fr; e.setTexture(e.texBase + fr); }
+  if (e.fam === 'skel' || e.fam === 'imp' || e.fam === 'bomber' || e.fam === 'slime' || e.fam === 'mini' || e.fam === 'mimic') {
+    e.setFlipX(P.x < e.x);
+  }
+
+  switch (e.fam) {
+    case 'skel': {
+      const a = Math.atan2(P.y - e.y, P.x - e.x) + Math.sin(time / 320 + e.seed) * 0.45;
+      e.setVelocity(Math.cos(a) * e.speed, Math.sin(a) * e.speed);
+      break;
+    }
+    case 'imp': {
+      if (e.aiState === 'wait') {
+        const a = Math.atan2(P.y - e.y, P.x - e.x);
+        e.setVelocity(Math.cos(a) * 26, Math.sin(a) * 26);
+        if (e.stateUntil - time < 280 * telegraphMult()) {
+          if (Math.floor(time / 70) % 2) e.setTintFill(0xffffff); else e.clearTint();
+        }
+        if (time >= e.stateUntil) {
+          e.aiState = 'charge';
+          e.stateUntil = time + 460;
+          const ca = Math.atan2(P.y - e.y, P.x - e.x);
+          e.chargeDir = { x: Math.cos(ca), y: Math.sin(ca) };
+          e.chainLeft = e.elite ? 1 : 0;   // elite imps charge twice
+          e.clearTint();
+        }
+      } else {
+        e.setVelocity(e.chargeDir.x * e.speed, e.chargeDir.y * e.speed);
+        if (time >= e.stateUntil) {
+          if (e.chainLeft > 0) {
+            e.chainLeft--;
+            const ca = Math.atan2(P.y - e.y, P.x - e.x);
+            e.chargeDir = { x: Math.cos(ca), y: Math.sin(ca) };
+            e.stateUntil = time + 420;
+          } else {
+            e.aiState = 'wait';
+            e.stateUntil = time + Phaser.Math.Between(550, 900);
+          }
+        }
+      }
+      break;
+    }
+    case 'bat': {
+      let vx = e.body.velocity.x, vy = e.body.velocity.y;
+      if (Math.hypot(vx, vy) < 1) { vx = Math.cos(e.dir); vy = Math.sin(e.dir); }
+      const k = e.speed / (Math.hypot(vx, vy) || 1);
+      e.setVelocity(vx * k, vy * k);
+      e.setFlipX(vx < 0);
+      break;
+    }
+    case 'turret': {
+      if (!e.telegraphed && time > e.nextShot - 350 * telegraphMult()) {
+        e.telegraphed = true;
+        scene.tweens.add({ targets: e, scaleX: 1.3, scaleY: 1.3, duration: 320 * telegraphMult() });
+      }
+      if (time > e.nextShot) {
+        e.nextShot = time + 2000;
+        e.telegraphed = false;
+        scene.tweens.killTweensOf(e);
+        e.setScale(1);
+        const a = Math.atan2(P.y - e.y, P.x - e.x);
+        fireProjectile(scene, e.x + Math.cos(a) * 12, e.y + Math.sin(a) * 12, a, (108 + RUN.floor * 8) * enemySlowMult());
+      }
+      break;
+    }
+    case 'slime': case 'mini': {
+      const a = Math.atan2(P.y - e.y, P.x - e.x);
+      const pulse = 0.55 + 0.45 * Math.sin(time / 180 + e.seed);   // squishy gait
+      e.setVelocity(Math.cos(a) * e.speed * pulse, Math.sin(a) * e.speed * pulse);
+      break;
+    }
+    case 'ghost': {
+      const a = Math.atan2(P.y - e.y, P.x - e.x);
+      e.setVelocity(Math.cos(a) * e.speed, Math.sin(a) * e.speed + Math.sin(time / 260 + e.seed) * 14);
+      e.setAlpha(0.55 + 0.25 * Math.sin(time / 300 + e.seed));
+      e.setFlipX(P.x < e.x);
+      break;
+    }
+    case 'knight': {
+      const stunned = time < e.stunnedUntil;
+      if (!stunned) {
+        const d = Phaser.Math.Distance.Between(e.x, e.y, P.x, P.y) || 1;
+        e.faceVec = { x: (P.x - e.x) / d, y: (P.y - e.y) / d };
+        e.setVelocity(e.faceVec.x * e.speed, e.faceVec.y * e.speed);
+        e.clearTint();
+        e.setFlipX(e.faceVec.x < 0);
+      } else {
+        e.setVelocity(e.body.velocity.x * 0.9, e.body.velocity.y * 0.9);
+        if (Math.floor(time / 80) % 2) e.setTintFill(0xffffff); else e.clearTint();
+      }
+      break;
+    }
+    case 'bomber': {
+      const a = Math.atan2(P.y - e.y, P.x - e.x) + Math.sin(time / 240 + e.seed) * 0.7;
+      e.setVelocity(Math.cos(a) * e.speed, Math.sin(a) * e.speed);
+      break;
+    }
+    case 'summoner': {
+      if (e.phase === 'idle' && time > e.phaseUntil) {
+        if (countSummoned(scene) < 5) {
+          e.phase = 'wind';
+          e.phaseUntil = time + 380 * telegraphMult();
+          scene.tweens.add({ targets: e, scaleX: 1.3, scaleY: 1.3, duration: 350 * telegraphMult() });
+        } else {
+          e.phaseUntil = time + 900;
+        }
+      } else if (e.phase === 'wind' && time > e.phaseUntil) {
+        e.phase = 'idle';
+        e.phaseUntil = time + 2600;
+        scene.tweens.killTweensOf(e);
+        e.setScale(1);
+        const m = spawnEnemy(scene, 'skel', e.x + Phaser.Math.Between(-30, 30), e.y + Phaser.Math.Between(20, 34));
+        m.summoned = true; m.awake = true;
+        m.setAlpha(0);
+        scene.tweens.add({ targets: m, alpha: 1, duration: 250 });
+        pixelBurst(scene, m.x, m.y, tintFor('summoner', scene.themeI), 6);
+      }
+      break;
+    }
+    case 'sniper': {
+      const dx = P.x - e.x, dy = P.y - e.y, d = Math.hypot(dx, dy) || 1;
+      if (e.phase === 'aim') {
+        e.laser.clear();
+        e.laser.lineStyle(1, 0xff4040, 0.35);
+        e.laser.lineBetween(e.x, e.y, P.x, P.y);
+        if (time > e.phaseUntil) {
+          e.phase = 'lock';
+          e.phaseUntil = time + 300;
+          e.lockDir = { x: dx / d, y: dy / d };
+        }
+      } else if (e.phase === 'lock') {
+        e.laser.clear();
+        e.laser.lineStyle(2, 0xff2020, 0.9);
+        e.laser.lineBetween(e.x, e.y, e.x + e.lockDir.x * 600, e.y + e.lockDir.y * 600);
+        if (time > e.phaseUntil) {
+          e.phase = 'rest';
+          e.phaseUntil = time + 1100;
+          e.laser.clear();
+          const a = Math.atan2(e.lockDir.y, e.lockDir.x);
+          fireProjectile(scene, e.x + e.lockDir.x * 12, e.y + e.lockDir.y * 12, a, 330, 'sbolt').setRotation(a);
+        }
+      } else if (time > e.phaseUntil) {
+        e.phase = 'aim';
+        e.phaseUntil = time + 900 * telegraphMult();
+      }
+      break;
+    }
+    case 'mimic': {
+      if (time < (e.harmlessUntil || 0)) { e.setVelocity(0, 0); break; }
+      if (e.aiState === 'pause') {
+        e.setVelocity(0, 0);
+        if (time > e.stateUntil) {
+          e.aiState = 'lunge';
+          e.stateUntil = time + 420;
+          const a = Math.atan2(P.y - e.y, P.x - e.x);
+          e.chargeDir = { x: Math.cos(a), y: Math.sin(a) };
+        }
+      } else {
+        e.setVelocity(e.chargeDir.x * e.speed, e.chargeDir.y * e.speed);
+        if (time > e.stateUntil) { e.aiState = 'pause'; e.stateUntil = time + 320; }
+      }
+      break;
+    }
+    case 'boss': updateBoss(scene, e, time, delta); break;
+  }
+}
+
+/* ================================================================
+   BOSSES - 8 archetypes; floors past 8 recycle them faster and
+   angrier, stacking teleports (f13+) and bullet rings (f17+)
+   ================================================================ */
+function bossIntro(scene, def) {
+  const t1 = tagU(scene, ptext(scene, W / 2, H / 2 - 70, def.name, 30, '#ffd23f')).setDepth(21).setAlpha(0);
+  const t2 = tagU(scene, ptext(scene, W / 2, H / 2 - 30, def.quip, 10, '#9a9ab0')).setDepth(21).setAlpha(0);
+  scene.tweens.add({ targets: [t1, t2], alpha: 1, duration: 250, yoyo: true, hold: 1100,
+    onComplete: () => { t1.destroy(); t2.destroy(); } });
+}
+
+function spawnBoss(scene) {
+  const f = RUN.floor;
+  const def = BOSS_DEFS[bossIndex(f)];
+  const cx = scene.RW / 2, cy = scene.RH / 2;
+  const b = scene.enemies.create(cx, cy - 80, 'boss_' + def.key + '_0');
+  tagW(scene, b).setDepth(5);
+  b.fam = 'boss'; b.isBoss = true; b.bossKey = def.key; b.dead = false;
+  b.texBase = 'boss_' + def.key + '_'; b.frame_ = 0; b.seed = Math.random() * 1000;
+  b.setScale(2);
+  b.setCollideWorldBounds(true);
+  b.body.setSize(17, 15);
+  const mult = bossSpeedMult(f);
+  b.mult = mult;
+  const ready = scene.spawnStart + graceTime();
+  b.extraTpAt = f >= 13 ? ready + 6000 : Infinity;
+  b.extraRingAt = f >= 17 ? ready + 4000 : Infinity;
+  scene.bossParts = 1;
+
+  if (def.key === 'gear') {
+    Object.assign(b, { cx, cy, radius: Math.min(scene.RW, scene.RH) / 2 - 110, t: -Math.PI / 2,
+      angSpeed: 1.15 * mult, nextFire: ready + 900, fireEvery: 1600 / mult, shots: 4, fireOffset: 0 });
+  } else if (def.key === 'warden') {
+    Object.assign(b, { nextTp: ready + 1200, tpEvery: 1900 / mult, tpPhase: 'idle', driftSpeed: 40 * mult });
+  } else if (def.key === 'mino') {
+    Object.assign(b, { phase: 'track', phaseUntil: ready + 800, chargeSpeed: Math.min(640, 540 * mult) });
+  } else if (def.key === 'sking') {
+    Object.assign(b, { gen: 0, hopState: 'rest', hopUntil: ready + 600, leapSpeed: 230 * mult });
+  } else if (def.key === 'queen') {
+    Object.assign(b, { nextWave: ready + 1400, waveEvery: 2200 / mult, nextSpread: ready + 2600 });
+  } else if (def.key === 'cust') {
+    b.body.reset(cx, 70);
+    Object.assign(b, { slideDir: 1, nextSweep: ready + 1500, sweepEvery: 2800 / mult, sweepType: false });
+  } else if (def.key === 'orb') {
+    Object.assign(b, { cx, cy, t: 0, spiralA: 0, nextSpiral: ready + 800, nextRing: ready + 3000, ringEvery: 3200 / mult });
+  } else if (def.key === 'rex') {
+    Object.assign(b, { phase: 'orbit', orbA: Math.random() * 6.28, orbitSpeed: 1.1 * mult,
+      nextDash: ready + 2500, dashEvery: 2600 / mult, phaseUntil: 0 });
+  }
+  bossIntro(scene, def);
+  return b;
+}
+
+// splitter king pieces: gen 0 (king) -> two gen 1 -> four gen 2
+function spawnKingPart(scene, gen, x, y) {
+  const t = scene.themeI;
+  const key = (gen === 1 ? 'slime_' : 'mini_') + t + '_';
+  const b = scene.enemies.create(x, y, key + '0');
+  tagW(scene, b).setDepth(5);
+  b.fam = 'boss'; b.isBoss = true; b.bossKey = 'sking'; b.gen = gen;
+  b.texBase = key; b.frame_ = 0; b.seed = Math.random() * 1000; b.dead = false;
+  b.setScale(gen === 1 ? 1.6 : 1.3);
+  b.setCollideWorldBounds(true);
+  b.body.setSize(gen === 1 ? 14 : 8, gen === 1 ? 11 : 7);
+  b.mult = bossSpeedMult(RUN.floor);
+  b.hopState = 'rest';
+  b.hopUntil = nowMs(scene) + 400 + Math.random() * 300;
+  b.leapSpeed = (gen === 1 ? 270 : 310) * b.mult;
+  b.harmlessUntil = nowMs(scene) + 350;
+  b.extraTpAt = Infinity; b.extraRingAt = Infinity;
+  scene.bossParts++;
+  return b;
+}
+
+function updateBoss(scene, b, time, delta) {
+  const dt = delta / 1000, P = scene.player;
+  if (!(b.frameHold > time)) {
+    const fr = Math.floor(time / 300) % 2;
+    if (b.frame_ !== fr && b.texBase) { b.frame_ = fr; b.setTexture(b.texBase + fr); }
+  }
+  // deep-floor stacked habits
+  if (time > b.extraTpAt) {
+    b.extraTpAt = time + 6000;
+    AUDIO.sfx.zip();
+    pixelBurst(scene, b.x, b.y, 0xffd23f, 10);
+    const d = findSpawnPos(scene, 170);
+    b.body.reset(d.x, d.y);
+    if (b.cx !== undefined) { b.cx = d.x; b.cy = d.y; }
+    pixelBurst(scene, d.x, d.y, 0xffd23f, 10);
+  }
+  if (time > b.extraRingAt) {
+    b.extraRingAt = time + 4000;
+    for (let i = 0; i < 10; i++) {
+      const a = b.seed + i * (Math.PI * 2 / 10);
+      fireProjectile(scene, b.x, b.y, a, 95, 'bbolt');
+    }
+  }
+
+  switch (b.bossKey) {
+    case 'gear': {
+      b.t += b.angSpeed * dt;
+      b.body.reset(b.cx + Math.cos(b.t) * b.radius, b.cy + Math.sin(b.t) * b.radius * 0.7);
+      b.rotation += dt * 1.4;
+      if (time > b.nextFire) {
+        b.nextFire = time + b.fireEvery;
+        b.fireOffset += 0.6;
+        for (let i = 0; i < b.shots; i++) {
+          const a = b.fireOffset + i * (Math.PI * 2 / b.shots);
+          fireProjectile(scene, b.x + Math.cos(a) * 28, b.y + Math.sin(a) * 28, a, 100 + RUN.floor * 4, 'bbolt');
+        }
+        scene.tweens.add({ targets: b, scaleX: 2.25, scaleY: 2.25, duration: 90, yoyo: true });
+      }
+      break;
+    }
+    case 'warden': {
+      const a = Math.atan2(P.y - b.y, P.x - b.x);
+      b.setVelocity(Math.cos(a) * b.driftSpeed, Math.sin(a) * b.driftSpeed);
+      if (b.tpPhase === 'idle' && time > b.nextTp) {
+        b.tpPhase = 'warn';
+        b.tpAt = time + 470 * telegraphMult();
+        b.dest = findSpawnPos(scene, 140);
+        b.marker = tagW(scene, scene.add.image(b.dest.x, b.dest.y, 'boss_warden_0')
+          .setScale(2).setAlpha(0.22).setTintFill(0xffffff)).setDepth(4);
+        scene.tweens.add({ targets: b.marker, alpha: 0.5, yoyo: true, repeat: -1, duration: 120 });
+      } else if (b.tpPhase === 'warn' && time > b.tpAt) {
+        b.tpPhase = 'idle';
+        b.nextTp = time + b.tpEvery;
+        if (b.marker) { scene.tweens.killTweensOf(b.marker); b.marker.destroy(); b.marker = null; }
+        AUDIO.sfx.zip();
+        pixelBurst(scene, b.x, b.y, 0xffd23f, 10);
+        b.body.reset(b.dest.x, b.dest.y);
+        pixelBurst(scene, b.x, b.y, 0xffd23f, 10);
+        const minions = scene.enemies.countActive(true) - scene.bossParts;
+        for (let i = 0; i < Math.min(2, Math.max(0, 6 - minions)); i++) {
+          const m = spawnEnemy(scene, 'skel',
+            Phaser.Math.Clamp(b.x + (i === 0 ? -46 : 46), 24, scene.RW - 24),
+            Phaser.Math.Clamp(b.y + Phaser.Math.Between(-30, 30), 24, scene.RH - 24));
+          m.summoned = true; m.awake = true;
+          m.setAlpha(0);
+          scene.tweens.add({ targets: m, alpha: 1, duration: 250 });
+        }
+      }
+      break;
+    }
+    case 'mino': {
+      if (b.phase === 'track') {
+        const a = Math.atan2(P.y - b.y, P.x - b.x);
+        b.setVelocity(Math.cos(a) * 70 * b.mult, Math.sin(a) * 70 * b.mult);
+        b.setFlipX(P.x < b.x);
+        if (time > b.phaseUntil) { b.phase = 'snort'; b.phaseUntil = time + 450 * telegraphMult(); }
+      } else if (b.phase === 'snort') {
+        b.setVelocity(0, 0);
+        b.x += Math.sin(time / 30) * 0.8;   // pawing the ground
+        if (Math.floor(time / 70) % 2) b.setTintFill(0xff6050); else b.clearTint();
+        if (time > b.phaseUntil) {
+          b.phase = 'charge'; b.clearTint();
+          const a = Math.atan2(P.y - b.y, P.x - b.x);
+          b.chargeDir = { x: Math.cos(a), y: Math.sin(a) };
+          b.phaseUntil = time + 2200;
+        }
+      } else if (b.phase === 'charge') {
+        b.setVelocity(b.chargeDir.x * b.chargeSpeed, b.chargeDir.y * b.chargeSpeed);
+        const bl = b.body.blocked;
+        if (bl.left || bl.right || bl.up || bl.down || time > b.phaseUntil) {
+          scene.cameras.main.shake(220, 0.012);
+          pixelBurst(scene, b.x, b.y, 0xffd23f, 14, true);
+          for (let i = 0; i < 6; i++) fireProjectile(scene, b.x, b.y, i * Math.PI / 3, 110, 'bbolt');
+          b.phase = 'stun'; b.phaseUntil = time + 800;
+          b.setVelocity(0, 0);
+        }
+      } else {
+        b.setAlpha(0.6 + 0.3 * Math.sin(time / 60));
+        if (time > b.phaseUntil) { b.setAlpha(1); b.phase = 'track'; b.phaseUntil = time + 700; }
+      }
+      break;
+    }
+    case 'sking': {
+      if (b.hopState === 'rest') {
+        b.setVelocity(b.body.velocity.x * 0.85, b.body.velocity.y * 0.85);
+        if (time > b.hopUntil) {
+          b.hopState = 'leap'; b.hopUntil = time + 360;
+          const a = Math.atan2(P.y - b.y, P.x - b.x);
+          b.setVelocity(Math.cos(a) * b.leapSpeed, Math.sin(a) * b.leapSpeed);
+          scene.tweens.add({ targets: b, scaleY: b.scaleY * 0.8, duration: 120, yoyo: true });
+        }
+      } else if (time > b.hopUntil) {
+        b.hopState = 'rest';
+        b.hopUntil = time + (b.gen === 0 ? 520 : 380);
+      }
+      break;
+    }
+    case 'queen': {
+      const d = Phaser.Math.Distance.Between(b.x, b.y, P.x, P.y) || 1;
+      if (d < 250) {
+        b.setVelocity((b.x - P.x) / d * 70 * b.mult, (b.y - P.y) / d * 70 * b.mult);
+      } else {
+        b.setVelocity((P.y - b.y) / d * 45, (b.x - P.x) / d * 45);   // sidle, regally
+      }
+      if (time > b.nextWave) {
+        b.nextWave = time + b.waveEvery;
+        const minions = scene.enemies.countActive(true) - scene.bossParts;
+        const fams = ['skel', 'imp', 'bat'].filter(fm => RUN.floor >= FAM_DEBUT[fm] || fm === 'skel');
+        for (let i = 0; i < Math.min(2, Math.max(0, 7 - minions)); i++) {
+          const m = spawnEnemy(scene, Phaser.Utils.Array.GetRandom(fams),
+            Phaser.Math.Clamp(b.x + Phaser.Math.Between(-50, 50), 24, scene.RW - 24),
+            Phaser.Math.Clamp(b.y + Phaser.Math.Between(20, 50), 24, scene.RH - 24));
+          m.summoned = true; m.awake = true;
+          m.setAlpha(0);
+          scene.tweens.add({ targets: m, alpha: 1, duration: 250 });
+        }
+        pixelBurst(scene, b.x, b.y + 20, 0x8a4ce8, 8);
+      }
+      if (time > b.nextSpread) {
+        b.nextSpread = time + 5000 / b.mult;
+        const a = Math.atan2(P.y - b.y, P.x - b.x);
+        [-0.3, 0, 0.3].forEach(off => fireProjectile(scene, b.x, b.y, a + off, 120, 'bbolt'));
+      }
+      break;
+    }
+    case 'cust': {
+      b.body.reset(b.x + b.slideDir * 130 * b.mult * dt, 70);
+      if (b.x < 90) b.slideDir = 1;
+      if (b.x > scene.RW - 90) b.slideDir = -1;
+      if (time > b.nextSweep) {
+        b.nextSweep = time + b.sweepEvery;
+        b.sweepType = !b.sweepType;
+        scene.cameras.main.shake(120, 0.004);
+        if (b.sweepType) {
+          // vertical curtain falling from the top, with two gaps
+          const g1 = Phaser.Math.Between(80, scene.RW - 80), g2 = Phaser.Math.Between(80, scene.RW - 80);
+          for (let x = 50; x < scene.RW - 30; x += 76) {
+            if (Math.abs(x - g1) < 58 || Math.abs(x - g2) < 58) continue;
+            fireProjectile(scene, x, 36, Math.PI / 2, 115, 'bbolt');
+          }
+        } else {
+          // horizontal broom from the side, one gap
+          const g1 = Phaser.Math.Between(70, scene.RH - 70);
+          const fromLeft = Math.random() < 0.5;
+          for (let y = 50; y < scene.RH - 30; y += 74) {
+            if (Math.abs(y - g1) < 64) continue;
+            fireProjectile(scene, fromLeft ? 30 : scene.RW - 30, y, fromLeft ? 0 : Math.PI, 115, 'bbolt');
+          }
+        }
+      }
+      break;
+    }
+    case 'orb': {
+      b.t += dt * 0.7;
+      b.body.reset(b.cx + Math.cos(b.t) * 55, b.cy + Math.sin(b.t) * 40);
+      if (time > b.nextSpiral) {
+        b.nextSpiral = time + 170;
+        b.spiralA += 0.42;
+        fireProjectile(scene, b.x, b.y, b.spiralA, 88, 'bolt');
+        fireProjectile(scene, b.x, b.y, b.spiralA + Math.PI, 88, 'bolt');
+      }
+      if (time > b.nextRing) {
+        b.nextRing = time + b.ringEvery;
+        for (let i = 0; i < 12; i++) fireProjectile(scene, b.x, b.y, i * Math.PI / 6, 95, 'bbolt');
+        scene.tweens.add({ targets: b, scaleX: 2.3, scaleY: 2.3, duration: 110, yoyo: true });
+      }
+      break;
+    }
+    case 'rex': {
+      if (b.phase === 'orbit') {
+        b.orbA += dt * b.orbitSpeed;
+        const tx = P.x + Math.cos(b.orbA) * 170, ty = P.y + Math.sin(b.orbA) * 170;
+        const a = Math.atan2(ty - b.y, tx - b.x);
+        b.setVelocity(Math.cos(a) * 150 * b.mult, Math.sin(a) * 150 * b.mult);
+        b.setFlipX(P.x < b.x);
+        if (time > b.nextDash) { b.phase = 'windup'; b.phaseUntil = time + 420 * telegraphMult(); }
+      } else if (b.phase === 'windup') {
+        b.setVelocity(0, 0);
+        b.setScale(2, 1.8);
+        if (Math.floor(time / 70) % 2) b.setTintFill(0xff5060); else b.clearTint();
+        if (time > b.phaseUntil) {
+          b.phase = 'dash'; b.clearTint(); b.setScale(2);
+          const a = Math.atan2(P.y - b.y, P.x - b.x);
+          b.chargeDir = { x: Math.cos(a), y: Math.sin(a) };
+          b.phaseUntil = time + 380;
+          b.setTexture('boss_rex_p');
+          b.frameHold = time + 500;
+          // his punch flash, because imitation is the sincerest form of theft
+          const fx = tagW(scene, scene.add.image(b.x + b.chargeDir.x * 30, b.y + b.chargeDir.y * 30, 'pix')
+            .setScale(9).setAlpha(0.7).setTint(0xff5060)).setDepth(8);
+          scene.tweens.add({ targets: fx, alpha: 0, scale: 11, duration: 140, onComplete: () => fx.destroy() });
+        }
+      } else if (b.phase === 'dash') {
+        b.setVelocity(b.chargeDir.x * 520 * b.mult, b.chargeDir.y * 520 * b.mult);
+        if (time > b.phaseUntil) { b.phase = 'recover'; b.phaseUntil = time + 650; b.setVelocity(0, 0); }
+      } else {
+        b.setAlpha(0.85);
+        if (time > b.phaseUntil) {
+          b.setAlpha(1); b.phase = 'orbit'; b.nextDash = time + b.dashEvery;
+          if (!b.taunted) { b.taunted = true; floatText(scene, b.x, b.y - 30, 'my gimmick now', '#ff5060'); }
+        }
+      }
+      break;
+    }
+  }
+}
+
+function roomBanner(scene) {
+  if (scene.isBossRoom) return;
+  const t = tagU(scene, ptext(scene, W / 2, 92,
+    'FLOOR ' + RUN.floor + ' - ROOM ' + RUN.room + '/' + ROOMS_PER_FLOOR, 11, '#8888a0')).setDepth(20);
+  scene.tweens.add({ targets: t, alpha: 0, delay: 1000, duration: 400, onComplete: () => t.destroy() });
+}
+
+/* ================================================================
+   GAME SCENE - one room at a time. one hit each way.
+   main camera follows the player; uiCam draws the HUD at zoom 1.
+   ================================================================ */
+class GameScene extends Phaser.Scene {
+  constructor() { super('Game'); }
+
+  create() {
+    this.isBossRoom = RUN.room === ROOMS_PER_FLOOR;
+    this.themeI = themeIdx(RUN.floor);
+    if (this.isBossRoom) { this.RW = BOSS_ARENA.w; this.RH = BOSS_ARENA.h; }
+    else { const s = Phaser.Utils.Array.GetRandom(ROOM_SIZES); this.RW = s.w; this.RH = s.h; }
+    this.roomCleared = false;
+    this.playerDead = false;
+    this.leaving = false;
+    this.victory = false;
+    this.lastPunch = -9999;
+    this.punchPoseUntil = 0;
+    this.facing = { x: 1, y: 0 };
+    this.spawnStart = nowMs(this);
+    this.combo = 0; this.comboUntil = 0;
+    this.bossParts = 0;
+    this.torchFrame = 0;
+    this.arenaRect = new Phaser.Geom.Rectangle(-10, -10, this.RW + 20, this.RH + 20);
+
+    // two cameras: world (zoomed, follows) + UI (fixed)
+    this.uiCam = this.cameras.add(0, 0, W, H);
+    const main = this.cameras.main;
+    main.setBackgroundColor(0x06060a);
+    if (this.isBossRoom) {
+      main.setZoom(1);
+      main.centerOn(this.RW / 2, this.RH / 2);
+    } else {
+      main.setZoom(ROOM_ZOOM);
+      main.setBounds(-40, -40, this.RW + 80, this.RH + 80);
+    }
+
+    this.physics.world.setBounds(0, 0, this.RW, this.RH);
+
+    this.obstacles = this.physics.add.staticGroup();
+    this.enemies = this.physics.add.group();
+    this.projectiles = this.physics.add.group();
+
+    // player (before room dressing so placement can avoid the spawn)
+    this.player = this.physics.add.image(54, this.RH / 2, 'hero_idle');
+    tagW(this, this.player).setDepth(5);
+    this.player.setCollideWorldBounds(true);
+    this.player.body.setSize(12, 13);
+    this.facingMark = tagW(this, this.add.image(0, 0, 'pix')).setScale(2, 0.8).setDepth(7);
+    if (!this.isBossRoom) main.startFollow(this.player, true, 0.12, 0.12);
+
+    buildRoom(this);
+    spawnObstacleClusters(this);
+
+    // physics rules
+    this.physics.add.collider(this.player, this.obstacles);
+    this.physics.add.collider(this.enemies, this.obstacles, null, (e) => !e.isBoss && !e.ghost, this);
+    this.physics.add.overlap(this.player, this.enemies, () => this.killPlayer(),
+      (pl, en) => !this.playerDead && !this.leaving && !this.victory && !this.isFrozen() && en.active &&
+                  !(en.fam === 'mimic' && en.disguised) && !(en.harmlessUntil > nowMs(this)), this);
+    this.physics.add.overlap(this.player, this.projectiles, () => this.killPlayer(),
+      () => !this.playerDead && !this.leaving && !this.victory, this);
+    this.physics.add.overlap(this.projectiles, this.obstacles, (p) => {
+      pixelBurst(this, p.x, p.y, 0x9bdcff, 5);
+      p.destroy();
+    });
+
+    // exit door on the right wall
+    const dy = this.RH / 2;
+    this.doorVis = tagW(this, this.add.image(this.RW + 4, dy, 'door_' + this.themeI + '_c')).setScale(2).setDepth(3);
+    this.doorZone = this.add.zone(this.RW - 8, dy, 20, 64);
+    this.physics.add.existing(this.doorZone, true);
+    this.physics.add.overlap(this.player, this.doorZone, () => {
+      if (this.roomCleared && !this.leaving && !this.playerDead && !this.isBossRoom) this.gotoNext();
+    });
+
+    buildHUD(this);
+
+    // input
+    this.keys = this.input.keyboard.addKeys('W,A,S,D,UP,DOWN,LEFT,RIGHT,SPACE,J,X');
+    this.input.on('pointerdown', (ptr) => {
+      const wp = this.cameras.main.getWorldPoint(ptr.x, ptr.y);
+      const dx = wp.x - this.player.x, dyy = wp.y - this.player.y;
+      const l = Math.hypot(dx, dyy) || 1;
+      this.facing = { x: dx / l, y: dyy / l };
+      this.tryPunch();
+    });
+
+    // populate
+    AUDIO.play(this.isBossRoom ? (BOSS_DEFS[bossIndex(RUN.floor)].key === 'rex' ? 'bossrex' : 'boss') : 'theme' + this.themeI);
+    if (this.isBossRoom) spawnBoss(this); else this.spawnWave();
+    if (this.mimicSpot) spawnEnemy(this, 'mimic', this.mimicSpot.x, this.mimicSpot.y);
+    roomBanner(this);
+    main.fadeIn(180, 0, 0, 0);
+  }
+
+  isFrozen() { return nowMs(this) < this.spawnStart + graceTime(); }
+
+  spawnWave() {
+    const pool = enemyPool(RUN.floor);
+    let n = 3 + Math.min(RUN.floor, 9) + Phaser.Math.Between(0, 2) + (RUN.room === 3 ? 1 : 0);
+    n = Math.min(n, 16);
+    const counts = {};
+    for (let i = 0; i < n; i++) {
+      let fam = Phaser.Utils.Array.GetRandom(pool), tries = 0;
+      while (ROOM_CAPS[fam] !== undefined && (counts[fam] || 0) >= ROOM_CAPS[fam] && tries < 10) {
+        fam = Phaser.Utils.Array.GetRandom(pool); tries++;
+      }
+      counts[fam] = (counts[fam] || 0) + 1;
+      const pos = findSpawnPos(this, 260);
+      spawnEnemy(this, fam, pos.x, pos.y, { elite: Math.random() < eliteChance(RUN.floor) });
+    }
+  }
+
+  // -------- the punch --------
+  tryPunch() {
+    if (this.playerDead || this.leaving) return;
+    const now = nowMs(this);
+    if (now - this.lastPunch < punchCooldown()) return;
+    this.lastPunch = now;
+    this.punchPoseUntil = now + 140;
+    this.player.setTexture('hero_punch');
+    AUDIO.sfx.punch();
+
+    const r = punchRange();
+    const size = r + 18, half = size / 2;
+    const cx = this.player.x + this.facing.x * (r / 2 + 6);
+    const cy = this.player.y + this.facing.y * (r / 2 + 6);
+    const rect = new Phaser.Geom.Rectangle(cx - half, cy - half, size, size);
+    const pad = deflectPad();
+    const prect = new Phaser.Geom.Rectangle(cx - half - pad, cy - half - pad, size + pad * 2, size + pad * 2);
+
+    const fx = tagW(this, this.add.image(cx, cy, 'pix')).setScale(size / 4).setAlpha(0.85).setDepth(8);
+    this.tweens.add({ targets: fx, alpha: 0, scale: size / 4 * 1.2, duration: 90, onComplete: () => fx.destroy() });
+
+    let hit = false, killed = 0;
+    for (const e of this.enemies.getChildren().slice()) {
+      if (!e.active || e.dead || !Phaser.Geom.Intersects.RectangleToRectangle(rect, e.getBounds())) continue;
+      // shield knights block punches that arrive shield-first
+      if (e.fam === 'knight' && now >= e.stunnedUntil) {
+        const dot = this.facing.x * e.faceVec.x + this.facing.y * e.faceVec.y;
+        if (dot < -0.25) {
+          e.stunnedUntil = now + 700;
+          e.setVelocity(this.facing.x * 320, this.facing.y * 320);
+          pixelBurst(this, e.x, e.y, 0xd9c46a, 8);
+          floatText(this, e.x, e.y - 16, 'CLANK', '#d9c46a');
+          AUDIO.sfx.clank();
+          hit = true;
+          continue;
+        }
+      }
+      this.killEnemy(e);
+      killed++; hit = true;
+    }
+    // yes, you can punch bullets. you're One Shoticus.
+    for (const p of this.projectiles.getChildren().slice()) {
+      if (p.active && Phaser.Geom.Intersects.RectangleToRectangle(prect, p.getBounds())) {
+        pixelBurst(this, p.x, p.y, 0x9bdcff, 6);
+        p.destroy(); hit = true;
+        AUDIO.sfx.swat();
+      }
+    }
+    if (hit) this.cameras.main.shake(60, 0.004);
+    if (killed > 0) this.hitStop(killed > 1 ? 90 : 45);
+  }
+
+  // brief freeze-frame so kills feel like kills
+  hitStop(ms) {
+    if (this.playerDead) return;
+    this.physics.pause();
+    this.time.delayedCall(ms, () => { if (!this.playerDead && !this.leaving) this.physics.resume(); });
+  }
+
+  comboBump(time) {
+    if (time < this.comboUntil) this.combo++; else this.combo = 1;
+    this.comboUntil = time + 1200;
+    if (this.combo >= 2) {
+      this.comboText.setText('COMBO x' + this.combo).setAlpha(1).setScale(1.3);
+      this.tweens.add({ targets: this.comboText, scale: 1, duration: 140 });
+    }
+    return Math.min(3, 1 + (this.combo - 1) * 0.25);
+  }
+
+  // -------- deaths --------
+  killEnemy(e) {
+    if (!e.active || e.dead) return;
+    e.dead = true;
+    const time = nowMs(this);
+    const fam = e.fam, wasElite = e.elite, wasBoss = e.isBoss, key = e.bossKey, gen = e.gen;
+    const ex = e.x, ey = e.y;
+    const col = wasBoss ? 0xffd23f : tintFor(fam, this.themeI);
+    pixelBurst(this, ex, ey, col, wasBoss ? 24 : 12, wasBoss);
+
+    const mult = this.comboBump(time);
+    AUDIO.sfx.kill(this.combo);
+    let v;
+    if (wasBoss) v = key === 'sking' ? Math.round(50 * RUN.floor / ((gen || 0) + 1)) : 150 * RUN.floor;
+    else v = SCORE_VALUES[fam] || 10;
+    if (wasElite) v *= 2;
+    addScore(this, Math.round(v * mult) + tipBonus(), ex, ey - 12);
+
+    if (e.marker) { this.tweens.killTweensOf(e.marker); e.marker.destroy(); }
+    if (e.laser) e.laser.destroy();
+    this.tweens.killTweensOf(e);
+    e.destroy();
+
+    // bombers go out with an opinion (clear check deferred until the boom)
+    if (fam === 'bomber') {
+      const flash = tagW(this, this.add.image(ex, ey, 'pix')).setScale(7).setTint(0xff7a3c).setAlpha(0.8).setDepth(8);
+      this.tweens.add({ targets: flash, alpha: 0.2, yoyo: true, repeat: 2, duration: 90, onComplete: () => flash.destroy() });
+      this.cameras.main.shake(80, 0.006);
+      this.time.delayedCall(300, () => {
+        if (this.playerDead || this.leaving) return;
+        pixelBurst(this, ex, ey, 0xff7a3c, 14, true);
+        AUDIO.sfx.boom();
+        for (let i = 0; i < 4; i++) fireProjectile(this, ex, ey, Math.PI / 4 + i * Math.PI / 2, 130);
+        this.checkRoomClear();
+      });
+      return;
+    }
+    // slimes multiply out of spite
+    if (fam === 'slime') {
+      const n = wasElite ? 3 : 2;
+      for (let i = 0; i < n; i++) {
+        const m = spawnEnemy(this, 'mini',
+          Phaser.Math.Clamp(ex + (i - (n - 1) / 2) * 24, 16, this.RW - 16),
+          Phaser.Math.Clamp(ey + Phaser.Math.Between(-10, 10), 16, this.RH - 16),
+          { elite: wasElite });
+        m.awake = true;
+        m.harmlessUntil = time + 350;
+      }
+      return;
+    }
+
+    if (wasBoss) {
+      if (key === 'sking') {
+        this.bossParts--;
+        if ((gen || 0) < 2) {
+          for (let i = 0; i < 2; i++) spawnKingPart(this, (gen || 0) + 1, ex + (i === 0 ? -20 : 20), ey);
+        }
+        if (this.bossParts <= 0) this.onBossDead();
+      } else {
+        this.bossParts = 0;
+        this.onBossDead();
+      }
+    } else {
+      this.checkRoomClear();
+    }
+  }
+
+  checkRoomClear() {
+    if (!this.isBossRoom && !this.roomCleared && this.enemies.countActive(true) === 0) this.onRoomClear();
+  }
+
+  killPlayer() {
+    if (this.playerDead || this.leaving || this.victory || this.isFrozen()) return;
+    this.playerDead = true;
+    saveBest();
+    AUDIO.sfx.playerDeath();
+    AUDIO.stopMusic(true);
+    pixelBurst(this, this.player.x, this.player.y, 0xffe66d, 22, true);
+    pixelBurst(this, this.player.x, this.player.y, 0xffffff, 10);
+    this.player.disableBody(true, true);
+    this.facingMark.setVisible(false);
+    this.cameras.main.shake(280, 0.012);
+    this.physics.pause();
+    this.time.delayedCall(950, () => this.scene.start('Death'));
+  }
+
+  // -------- room / floor progression --------
+  onRoomClear() {
+    this.roomCleared = true;
+    addScore(this, clearBonus(), this.player.x, this.player.y - 20);
+    AUDIO.sfx.door();
+    this.doorVis.setTexture('door_' + this.themeI + '_o');
+    this.tweens.add({ targets: this.doorVis, alpha: { from: 0.6, to: 1 }, yoyo: true, repeat: -1, duration: 420 });
+    const nextIsBoss = RUN.room + 1 === ROOMS_PER_FLOOR;
+    const label = tagW(this, ptext(this, this.RW - 34, this.RH / 2 - 60,
+      nextIsBoss ? 'BOSS' : 'GO', nextIsBoss ? 12 : 9, nextIsBoss ? '#ff4040' : '#2ecc71')).setDepth(9);
+    this.tweens.add({ targets: label, alpha: 0.25, yoyo: true, repeat: -1, duration: nextIsBoss ? 280 : 500 });
+    banner(this, 'ROOM CLEAR', '#2ecc71');
+  }
+
+  onBossDead() {
+    this.roomCleared = true;
+    this.victory = true;
+    addScore(this, clearBonus(), this.player.x, this.player.y - 20);
+    this.enemies.getChildren().slice().forEach((m, i) => this.time.delayedCall(80 * i, () => {
+      if (m.active) {
+        pixelBurst(this, m.x, m.y, m.isBoss ? 0xffd23f : tintFor(m.fam, this.themeI), 10);
+        this.tweens.killTweensOf(m);
+        if (m.laser) m.laser.destroy();
+        if (m.marker) m.marker.destroy();
+        m.destroy();
+      }
+    }));
+    this.projectiles.getChildren().slice().forEach((p, i) => this.time.delayedCall(50 * i, () => {
+      if (p.active) { pixelBurst(this, p.x, p.y, 0x9bdcff, 5); p.destroy(); }
+    }));
+    this.cameras.main.shake(300, 0.008);
+    AUDIO.stopMusic(true);
+    AUDIO.jingle('fanfare');
+    banner(this, 'FLOOR ' + RUN.floor + ' CLEARED', '#ffd23f');
+    saveBest();
+    this.time.delayedCall(1500, () => {
+      this.leaving = true;
+      this.cameras.main.fadeOut(250, 0, 0, 0);
+      this.cameras.main.once('camerafadeoutcomplete', () => this.scene.start('Upgrade'));
+    });
+  }
+
+  gotoNext() {
+    this.leaving = true;
+    this.player.setVelocity(0, 0);
+    RUN.room++;
+    this.cameras.main.fadeOut(180, 0, 0, 0);
+    this.cameras.main.once('camerafadeoutcomplete', () => this.scene.restart());
+  }
+
+  // -------- per-frame --------
+  update(time, delta) {
+    if (this.playerDead || this.leaving) return;
+
+    const k = this.keys;
+    let ix = ((k.D.isDown || k.RIGHT.isDown) ? 1 : 0) - ((k.A.isDown || k.LEFT.isDown) ? 1 : 0);
+    let iy = ((k.S.isDown || k.DOWN.isDown) ? 1 : 0) - ((k.W.isDown || k.UP.isDown) ? 1 : 0);
+    const mag = Math.hypot(ix, iy);
+    if (mag > 0) {
+      ix /= mag; iy /= mag;
+      this.player.setVelocity(ix * playerSpeed(), iy * playerSpeed());
+      this.facing = { x: ix, y: iy };
+    } else {
+      this.player.setVelocity(0, 0);
+    }
+    // hero sprite: punch pose > walk cycle > idle
+    if (time > this.punchPoseUntil) {
+      this.player.setTexture(mag > 0 ? 'hero_walk_' + (Math.floor(time / 180) % 2) : 'hero_idle');
+    }
+    if (Math.abs(this.facing.x) > 0.1) this.player.setFlipX(this.facing.x < 0);
+
+    this.facingMark.setPosition(this.player.x + this.facing.x * 14, this.player.y + this.facing.y * 14);
+    this.facingMark.setRotation(Math.atan2(this.facing.y, this.facing.x));
+    this.facingMark.setAlpha(time - this.lastPunch < punchCooldown() ? 0.25 : 1);
+
+    if (Phaser.Input.Keyboard.JustDown(k.SPACE) || Phaser.Input.Keyboard.JustDown(k.J) || Phaser.Input.Keyboard.JustDown(k.X)) {
+      this.tryPunch();
+    }
+
+    // torch flicker
+    const tf = Math.floor(time / 140) % 2;
+    if (this.torchFrame !== tf) {
+      this.torchFrame = tf;
+      for (const t of this.torches) t.setTexture('torch_' + this.themeI + '_' + tf);
+    }
+    // combo readout fade
+    if (time > this.comboUntil && this.comboText.alpha > 0) this.comboText.setAlpha(this.comboText.alpha * 0.9);
+
+    const frozen = this.isFrozen();
+    for (const e of this.enemies.getChildren()) {
+      if (e.active) updateEnemy(this, e, time, delta, frozen);
+    }
+    for (const p of this.projectiles.getChildren().slice()) {
+      if (!p.active) continue;
+      if (p.texture.key !== 'sbolt') p.rotation += delta / 250;
+      if (!Phaser.Geom.Rectangle.Contains(this.arenaRect, p.x, p.y)) p.destroy();
+    }
+  }
+}
+
+/* ================================================================
+   UPGRADE SCENE - 3 random cards between floors.
+   none of them stop you from dying in one hit. sorry.
+   ================================================================ */
+class UpgradeScene extends Phaser.Scene {
+  constructor() { super('Upgrade'); }
+
+  create() {
+    this.picked = false;
+    this.cameras.main.fadeIn(200, 0, 0, 0);
+    ptext(this, W / 2, 100, 'FLOOR ' + RUN.floor + ' CLEARED', 24, '#ffd23f');
+    ptext(this, W / 2, 144, 'pick an upgrade. you will still die in one hit.', 9, '#9a9ab0');
+
+    const picks = Phaser.Utils.Array.Shuffle(UPGRADES.slice()).slice(0, 3);
+    picks.forEach((u, i) => this.makeCard(u, i));
+    ptext(this, W / 2, 520, 'click a card or press 1 / 2 / 3', 9, '#777788');
+
+    this.input.keyboard.on('keydown', (ev) => {
+      const n = parseInt(ev.key, 10);
+      if (n >= 1 && n <= 3) this.choose(picks[n - 1]);
+    });
+  }
+
+  makeCard(u, i) {
+    const x = 180 + i * 220, y = 330;
+    const bg = this.add.rectangle(x, y, 196, 230, 0x16161f).setStrokeStyle(2, 0x444455);
+    const lvl = RUN.up[u.key] || 0;
+    const parts = [bg,
+      this.add.text(x, y - 78, u.name, { fontFamily: FONT, fontSize: '11px', color: '#ffe66d', align: 'center', wordWrap: { width: 168 } }).setOrigin(0.5),
+      this.add.text(x, y - 14, u.desc, { fontFamily: FONT, fontSize: '9px', color: '#ffffff', align: 'center', wordWrap: { width: 168 } }).setOrigin(0.5),
+      this.add.text(x, y + 40, u.flavor, { fontFamily: FONT, fontSize: '8px', color: '#77778a', align: 'center', wordWrap: { width: 168 } }).setOrigin(0.5),
+      ptext(this, x, y + 78, lvl > 0 ? 'owned x' + lvl + '  [' + (i + 1) + ']' : '[' + (i + 1) + ']', 9, '#2ecc71')
+    ];
+    bg.setInteractive({ useHandCursor: true });
+    bg.on('pointerover', () => {
+      bg.setStrokeStyle(2, 0xffd23f).setFillStyle(0x1d1d2a);
+      parts.forEach(p => p.setScale(1.04));
+    });
+    bg.on('pointerout', () => {
+      bg.setStrokeStyle(2, 0x444455).setFillStyle(0x16161f);
+      parts.forEach(p => p.setScale(1));
+    });
+    bg.on('pointerdown', () => this.choose(u));
+  }
+
+  choose(u) {
+    if (this.picked) return;
+    this.picked = true;
+    AUDIO.sfx.pick();
+    RUN.up[u.key]++;
+    RUN.floor++;
+    RUN.room = 1;
+    this.cameras.main.fadeOut(220, 0, 0, 0);
+    this.cameras.main.once('camerafadeoutcomplete', () => this.scene.start('Game'));
+  }
+}
+
+/* ================================================================
+   DEATH SCENE - it happens to everyone. mostly to you.
+   ================================================================ */
+class DeathScene extends Phaser.Scene {
+  constructor() { super('Death'); }
+
+  create() {
+    saveBest();
+    AUDIO.stopMusic();
+    AUDIO.jingle('death');
+    this.cameras.main.flash(350, 90, 0, 0);
+
+    const big = ptext(this, W / 2, 150, 'YOU DIED', 44, '#e84545');
+    big.setScale(2).setAlpha(0);
+    this.tweens.add({ targets: big, scale: 1, alpha: 1, duration: 260, ease: 'Back.easeOut' });
+
+    ptext(this, W / 2, 218, Phaser.Utils.Array.GetRandom(DEATH_LINES), 10, '#9a9ab0');
+
+    ptext(this, W / 2, 290, 'FLOOR REACHED  ' + RUN.floor, 14, '#ffffff');
+    ptext(this, W / 2, 325, 'SCORE  ' + RUN.score, 14, '#ffffff');
+    const isBest = RUN.score > 0 && RUN.score >= SAVE.bestScore;
+    ptext(this, W / 2, 372, 'BEST  FLOOR ' + SAVE.bestFloor + ' / ' + SAVE.bestScore + ' PTS', 10, isBest ? '#ffd23f' : '#77778a');
+    if (isBest) {
+      const nb = ptext(this, W / 2, 400, 'NEW BEST!', 10, '#ffd23f');
+      this.tweens.add({ targets: nb, alpha: 0.3, yoyo: true, repeat: -1, duration: 300 });
+    }
+
+    const prompt = ptext(this, W / 2, 466, 'PRESS SPACE TO RETRY', 13, '#2ecc71');
+    this.tweens.add({ targets: prompt, alpha: 0.25, yoyo: true, repeat: -1, duration: 500 });
+    ptext(this, W / 2, 504, 'T = TITLE   M = MUTE', 8, '#55556a');
+
+    this.input.keyboard.on('keydown-SPACE', () => { AUDIO.sfx.blip(); RUN.reset(); this.scene.start('Game'); });
+    this.input.keyboard.on('keydown-T', () => this.scene.start('Title'));
+    this.input.on('pointerdown', () => { AUDIO.sfx.blip(); RUN.reset(); this.scene.start('Game'); });
+  }
+}
+
+/* ================================================================
+   GAME CONFIG + LAUNCH
+   ================================================================ */
+const config = {
+  type: Phaser.AUTO,
+  parent: 'game',
+  backgroundColor: '#06060a',
+  pixelArt: true,
+  roundPixels: true,
+  scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH, width: W, height: H },
+  physics: { default: 'arcade', arcade: { debug: false } },
+  scene: [BootScene, TitleScene, GameScene, UpgradeScene, DeathScene]
+};
+// exposed on window for easy console poking
+window.game = new Phaser.Game(config);
+window.RUN = RUN;
+</script>
+</body>
+</html>
