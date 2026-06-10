@@ -30,11 +30,14 @@
    ================================================================ */
 
 // ---------------- constants ----------------
-const W = 800, H = 600;
+const TOUCH_DEVICE = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+const VIEW_FORCE = new URLSearchParams(window.location.search).get('view');
+const PORTRAIT = VIEW_FORCE === 'portrait' || (VIEW_FORCE !== 'landscape' && TOUCH_DEVICE && window.innerHeight > window.innerWidth);
+const W = PORTRAIT ? 480 : 800, H = PORTRAIT ? 854 : 600;
 const ROOMS_PER_FLOOR = 4;          // 3 combat rooms + 1 boss room
-const ROOM_ZOOM = 1.5;              // follow-cam zoom in combat rooms
+const ROOM_ZOOM = PORTRAIT ? 1.3 : 1.5;    // follow-cam zoom in combat rooms
 const FONT = '"Press Start 2P", monospace';
-const BOSS_ARENA = { w: 760, h: 520 };  // fully visible at zoom 1
+const BOSS_ARENA = PORTRAIT ? { w: 440, h: 700 } : { w: 760, h: 520 };  // fully visible at zoom 1
 const ROOM_SIZES = [
   { w: 880, h: 620 }, { w: 1040, h: 700 }, { w: 1180, h: 780 }, { w: 1280, h: 860 }
 ];
@@ -1406,6 +1409,7 @@ class TitleScene extends Phaser.Scene {
 
   create() {
     AUDIO.play('title');
+    const oy = (H - 600) / 2;   // recenters the layout on tall portrait canvases
     // drifting themed enemies in the background, for menace
     this.decor = [];
     const fams = ['skel', 'imp', 'bat', 'turret', 'slime', 'ghost', 'knight', 'summoner'];
@@ -1422,29 +1426,29 @@ class TitleScene extends Phaser.Scene {
       this.decor.push(s);
     }
 
-    ptext(this, W / 2 + 4, 152, 'ONE SHOTICUS', 34, '#8a6d1f');
-    const logo = ptext(this, W / 2, 148, 'ONE SHOTICUS', 34, '#ffe66d');
-    this.tweens.add({ targets: logo, y: 144, yoyo: true, repeat: -1, duration: 1200, ease: 'Sine.easeInOut' });
+    ptext(this, W / 2 + 4, oy + 152, 'ONE SHOTICUS', 34, '#8a6d1f');
+    const logo = ptext(this, W / 2, oy + 148, 'ONE SHOTICUS', 34, '#ffe66d');
+    this.tweens.add({ targets: logo, y: oy + 144, yoyo: true, repeat: -1, duration: 1200, ease: 'Sine.easeInOut' });
 
     this.subIdx = Phaser.Math.Between(0, SUBTITLES.length - 1);
-    this.sub = ptext(this, W / 2, 212, SUBTITLES[this.subIdx], 10, '#9a9ab0');
+    this.sub = ptext(this, W / 2, oy + 212, SUBTITLES[this.subIdx], 10, '#9a9ab0');
     this.time.addEvent({ delay: 2800, loop: true, callback: () => {
       this.subIdx = (this.subIdx + 1) % SUBTITLES.length;
       this.sub.setText(SUBTITLES[this.subIdx]);
     }});
 
     // the man himself
-    const hero = this.add.image(W / 2, 330, 'hero_idle').setScale(5);
-    this.tweens.add({ targets: hero, y: 324, yoyo: true, repeat: -1, duration: 900, ease: 'Sine.easeInOut' });
+    const hero = this.add.image(W / 2, oy + 330, 'hero_idle').setScale(5);
+    this.tweens.add({ targets: hero, y: oy + 324, yoyo: true, repeat: -1, duration: 900, ease: 'Sine.easeInOut' });
 
     if (SAVE.bestFloor > 0) {
-      ptext(this, W / 2, 262, 'BEST RUN: FLOOR ' + SAVE.bestFloor + ' / ' + SAVE.bestScore + ' PTS', 10, '#ffd23f');
+      ptext(this, W / 2, oy + 262, 'BEST RUN: FLOOR ' + SAVE.bestFloor + ' / ' + SAVE.bestScore + ' PTS', 10, '#ffd23f');
     }
 
-    const prompt = ptext(this, W / 2, 432, 'PRESS SPACE TO START', 14, '#2ecc71');
+    const prompt = ptext(this, W / 2, oy + 432, TOUCH_DEVICE ? 'TAP TO START' : 'PRESS SPACE TO START', 14, '#2ecc71');
     this.tweens.add({ targets: prompt, alpha: 0.25, yoyo: true, repeat: -1, duration: 500 });
-    ptext(this, W / 2, 478, this.sys.game.device.input.touch ? 'LEFT THUMB MOVE   TAP RIGHT SIDE TO PUNCH' : 'WASD/ARROWS MOVE   SPACE/CLICK PUNCH   M MUTE', 8, '#777788');
-    ptext(this, W / 2, 565, 'a game about commitment issues', 8, '#55556a').setAlpha(0.7);
+    ptext(this, W / 2, oy + 478, this.sys.game.device.input.touch ? 'LEFT THUMB MOVE   TAP RIGHT SIDE TO PUNCH' : 'WASD/ARROWS MOVE   SPACE/CLICK PUNCH   M MUTE', 8, '#777788');
+    ptext(this, W / 2, H - 36, 'a game about commitment issues', 8, '#55556a').setAlpha(0.7);
 
     let begun = false;
     const begin = () => { if (!begun) { begun = true; AUDIO.sfx.blip(); RUN.reset(); this.scene.start('Game'); } };
@@ -2574,7 +2578,7 @@ class UpgradeScene extends Phaser.Scene {
 
     const picks = Phaser.Utils.Array.Shuffle(UPGRADES.slice()).slice(0, 3);
     picks.forEach((u, i) => this.makeCard(u, i));
-    ptext(this, W / 2, 520, 'click a card or press 1 / 2 / 3', 9, '#777788');
+    ptext(this, W / 2, PORTRAIT ? H - 38 : 520, TOUCH_DEVICE ? 'tap a card' : 'click a card or press 1 / 2 / 3', 9, '#777788');
 
     this.input.keyboard.on('keydown', (ev) => {
       const n = parseInt(ev.key, 10);
@@ -2583,8 +2587,8 @@ class UpgradeScene extends Phaser.Scene {
   }
 
   makeCard(u, i) {
-    const x = 180 + i * 220, y = 330;
-    const bg = this.add.rectangle(x, y, 196, 230, 0x16161f).setStrokeStyle(2, 0x444455);
+    const x = PORTRAIT ? W / 2 : 180 + i * 220, y = PORTRAIT ? 270 + i * 208 : 330;
+    const bg = this.add.rectangle(x, y, 196, PORTRAIT ? 196 : 230, 0x16161f).setStrokeStyle(2, 0x444455);
     const lvl = RUN.up[u.key] || 0;
     const parts = [bg,
       this.add.text(x, y - 78, u.name, { fontFamily: FONT, fontSize: '11px', color: '#ffe66d', align: 'center', wordWrap: { width: 168 } }).setOrigin(0.5),
@@ -2626,26 +2630,27 @@ class DeathScene extends Phaser.Scene {
     saveBest();
     AUDIO.stopMusic();
     AUDIO.jingle('death');
+    const oy = (H - 600) / 2;
     this.cameras.main.flash(350, 90, 0, 0);
 
-    const big = ptext(this, W / 2, 150, 'YOU DIED', 44, '#e84545');
+    const big = ptext(this, W / 2, oy + 150, 'YOU DIED', 44, '#e84545');
     big.setScale(2).setAlpha(0);
     this.tweens.add({ targets: big, scale: 1, alpha: 1, duration: 260, ease: 'Back.easeOut' });
 
-    ptext(this, W / 2, 218, Phaser.Utils.Array.GetRandom(DEATH_LINES), 10, '#9a9ab0');
+    ptext(this, W / 2, oy + 218, Phaser.Utils.Array.GetRandom(DEATH_LINES), 10, '#9a9ab0');
 
-    ptext(this, W / 2, 290, 'FLOOR REACHED  ' + RUN.floor, 14, '#ffffff');
-    ptext(this, W / 2, 325, 'SCORE  ' + RUN.score, 14, '#ffffff');
+    ptext(this, W / 2, oy + 290, 'FLOOR REACHED  ' + RUN.floor, 14, '#ffffff');
+    ptext(this, W / 2, oy + 325, 'SCORE  ' + RUN.score, 14, '#ffffff');
     const isBest = RUN.score > 0 && RUN.score >= SAVE.bestScore;
-    ptext(this, W / 2, 372, 'BEST  FLOOR ' + SAVE.bestFloor + ' / ' + SAVE.bestScore + ' PTS', 10, isBest ? '#ffd23f' : '#77778a');
+    ptext(this, W / 2, oy + 372, 'BEST  FLOOR ' + SAVE.bestFloor + ' / ' + SAVE.bestScore + ' PTS', 10, isBest ? '#ffd23f' : '#77778a');
     if (isBest) {
-      const nb = ptext(this, W / 2, 400, 'NEW BEST!', 10, '#ffd23f');
+      const nb = ptext(this, W / 2, oy + 400, 'NEW BEST!', 10, '#ffd23f');
       this.tweens.add({ targets: nb, alpha: 0.3, yoyo: true, repeat: -1, duration: 300 });
     }
 
-    const prompt = ptext(this, W / 2, 466, 'PRESS SPACE TO RETRY', 13, '#2ecc71');
+    const prompt = ptext(this, W / 2, oy + 466, TOUCH_DEVICE ? 'TAP TO RETRY' : 'PRESS SPACE TO RETRY', 13, '#2ecc71');
     this.tweens.add({ targets: prompt, alpha: 0.25, yoyo: true, repeat: -1, duration: 500 });
-    ptext(this, W / 2, 504, 'T = TITLE   M = MUTE', 8, '#55556a');
+    ptext(this, W / 2, oy + 504, 'T = TITLE   M = MUTE', 8, '#55556a');
 
     this.input.keyboard.on('keydown-SPACE', () => { AUDIO.sfx.blip(); RUN.reset(); this.scene.start('Game'); });
     this.input.keyboard.on('keydown-T', () => this.scene.start('Title'));
