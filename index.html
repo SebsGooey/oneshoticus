@@ -3,14 +3,14 @@
 <head>
 <meta charset="utf-8">
 <title>ONE SHOTICUS</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <link rel="icon" href="data:,">
 <!-- Pixel font (game falls back to monospace if offline) -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
 <style>
-  html, body { margin: 0; padding: 0; height: 100%; background: #06060a; }
+  html, body { margin: 0; padding: 0; height: 100%; background: #06060a; touch-action: none; overscroll-behavior: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
   body { display: flex; align-items: center; justify-content: center; overflow: hidden; }
   canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
   #fontload { position: absolute; left: -9999px; top: -9999px; font-family: 'Press Start 2P', monospace; }
@@ -283,6 +283,23 @@ function pixelBurst(scene, x, y, color, n, big) {
   }
 }
 
+// tappable sound toggle (phones have no M key)
+function muteButton(scene, x, y) {
+  const b = scene.add.text(x, y, AUDIO.muted ? 'SND OFF' : 'SND ON', {
+    fontFamily: FONT, fontSize: '9px', color: AUDIO.muted ? '#666677' : '#cfcfe0',
+    padding: { x: 10, y: 8 }
+  }).setOrigin(1, 0).setDepth(25);
+  tagU(scene, b);
+  b.setInteractive({ useHandCursor: true });
+  b.on('pointerdown', (ptr, lx, ly, ev) => {
+    if (ev && ev.stopPropagation) ev.stopPropagation();
+    AUDIO.unlock();
+    AUDIO.toggleMute();
+    b.setText(AUDIO.muted ? 'SND OFF' : 'SND ON').setColor(AUDIO.muted ? '#666677' : '#cfcfe0');
+  });
+  return b;
+}
+
 /* ================================================================
    AUDIO - chiptune engine. no files, just oscillators with attitude.
    music is note-strings parsed to a 32-step sequencer; sfx are
@@ -513,7 +530,7 @@ const AUDIO = {
   }
 };
 // first key/click/touch unlocks audio (browser autoplay rules); M mutes
-['keydown', 'pointerdown', 'touchstart'].forEach(ev =>
+['keydown', 'pointerdown', 'touchstart', 'touchend', 'click'].forEach(ev =>
   window.addEventListener(ev, (e) => {
     AUDIO.unlock();
     if (ev === 'keydown' && (e.key === 'm' || e.key === 'M')) AUDIO.toggleMute();
@@ -1426,13 +1443,14 @@ class TitleScene extends Phaser.Scene {
 
     const prompt = ptext(this, W / 2, 432, 'PRESS SPACE TO START', 14, '#2ecc71');
     this.tweens.add({ targets: prompt, alpha: 0.25, yoyo: true, repeat: -1, duration: 500 });
-    ptext(this, W / 2, 478, 'WASD/ARROWS MOVE   SPACE/CLICK PUNCH   M MUTE', 8, '#777788');
+    ptext(this, W / 2, 478, this.sys.game.device.input.touch ? 'LEFT THUMB MOVE   TAP RIGHT SIDE TO PUNCH' : 'WASD/ARROWS MOVE   SPACE/CLICK PUNCH   M MUTE', 8, '#777788');
     ptext(this, W / 2, 565, 'a game about commitment issues', 8, '#55556a').setAlpha(0.7);
 
     let begun = false;
     const begin = () => { if (!begun) { begun = true; AUDIO.sfx.blip(); RUN.reset(); this.scene.start('Game'); } };
     this.input.keyboard.on('keydown-SPACE', begin);
-    this.input.on('pointerdown', begin);
+    this.input.on('pointerdown', (ptr, over) => { if (!(over && over.length)) begin(); });
+    muteButton(this, W - 14, 14);
   }
 
   update(time, delta) {
@@ -1613,10 +1631,11 @@ function buildHUD(scene) {
   scene.hudR = tagU(scene, scene.add.text(W - 14, 14,
     THEMES[scene.themeI].name + '\nBEST  F' + SAVE.bestFloor + ' / ' + SAVE.bestScore,
     Object.assign(hudStyle(), { align: 'right' })).setOrigin(1, 0).setDepth(20));
+  scene.muteBtn = muteButton(scene, W - 14, 56);
   scene.comboText = tagU(scene, ptext(scene, W / 2, 64, '', 13, '#ffe66d')).setDepth(20).setAlpha(0);
   updateHUD(scene);
   if (RUN.floor === 1 && RUN.room === 1) {
-    tagU(scene, scene.add.text(W / 2, H - 20, 'WASD/ARROWS MOVE      SPACE/CLICK PUNCH',
+    tagU(scene, scene.add.text(W / 2, H - 20, scene.sys.game.device.input.touch ? 'LEFT THUMB MOVE      TAP RIGHT TO PUNCH' : 'WASD/ARROWS MOVE      SPACE/CLICK PUNCH',
       { fontFamily: FONT, fontSize: '8px', color: '#777788' }).setOrigin(0.5).setAlpha(0.7).setDepth(20));
   }
 }
@@ -2212,14 +2231,18 @@ class GameScene extends Phaser.Scene {
     buildHUD(this);
 
     // input
+    this.input.addPointer(2);
+    this.stick = { active: false, id: -1, ox: 0, oy: 0, nx: 0, ny: 0, mag: 0, R: 46 };
+    this.stickBase = tagU(this, this.add.circle(0, 0, 46).setStrokeStyle(2, 0xffffff, 0.35)).setDepth(25).setVisible(false);
+    this.stickThumb = tagU(this, this.add.circle(0, 0, 19, 0xffffff, 0.3)).setDepth(25).setVisible(false);
     this.keys = this.input.keyboard.addKeys('W,A,S,D,UP,DOWN,LEFT,RIGHT,SPACE,J,X');
-    this.input.on('pointerdown', (ptr) => {
-      const wp = this.cameras.main.getWorldPoint(ptr.x, ptr.y);
-      const dx = wp.x - this.player.x, dyy = wp.y - this.player.y;
-      const l = Math.hypot(dx, dyy) || 1;
-      this.facing = { x: dx / l, y: dyy / l };
-      this.tryPunch();
+    this.input.on('pointerdown', (ptr, over) => {
+      if (over && over.length) return;                 // tapped a UI button
+      if (ptr.wasTouch && ptr.x < W * 0.45 && !this.stick.active) { this.stickStart(ptr); return; }
+      this.aimPunch(ptr);
     });
+    this.input.on('pointermove', (ptr) => { if (this.stick.active && ptr.id === this.stick.id) this.stickMove(ptr); });
+    this.input.on('pointerup', (ptr) => { if (this.stick.active && ptr.id === this.stick.id) this.stickEnd(); });
 
     // populate
     AUDIO.play(this.isBossRoom ? (BOSS_DEFS[bossIndex(RUN.floor)].key === 'rex' ? 'bossrex' : 'boss') : 'theme' + this.themeI);
@@ -2245,6 +2268,36 @@ class GameScene extends Phaser.Scene {
       const pos = findSpawnPos(this, 260);
       spawnEnemy(this, fam, pos.x, pos.y, { elite: Math.random() < eliteChance(RUN.floor) });
     }
+  }
+
+  // -------- touch controls --------
+  // punch toward whatever was tapped (mouse clicks and right-half touches)
+  aimPunch(ptr) {
+    const wp = this.cameras.main.getWorldPoint(ptr.x, ptr.y);
+    const dx = wp.x - this.player.x, dy = wp.y - this.player.y;
+    const l = Math.hypot(dx, dy) || 1;
+    this.facing = { x: dx / l, y: dy / l };
+    this.tryPunch();
+  }
+  // floating joystick: spawns under the thumb, sized for physical screen px
+  stickStart(ptr) {
+    const ds = Math.min(2.4, Math.max(1, this.scale.displayScale.x));
+    this.stick = { active: true, id: ptr.id, ox: ptr.x, oy: ptr.y, nx: 0, ny: 0, mag: 0, R: 46 * ds };
+    this.stickBase.setPosition(ptr.x, ptr.y).setScale(ds).setVisible(true);
+    this.stickThumb.setPosition(ptr.x, ptr.y).setScale(ds).setVisible(true);
+  }
+  stickMove(ptr) {
+    const dx = ptr.x - this.stick.ox, dy = ptr.y - this.stick.oy;
+    const d = Math.hypot(dx, dy), cl = Math.min(d, this.stick.R);
+    this.stick.mag = cl / this.stick.R;
+    this.stick.nx = d > 4 ? dx / d : 0;
+    this.stick.ny = d > 4 ? dy / d : 0;
+    this.stickThumb.setPosition(this.stick.ox + this.stick.nx * cl, this.stick.oy + this.stick.ny * cl);
+  }
+  stickEnd() {
+    this.stick.active = false; this.stick.mag = 0;
+    this.stickBase.setVisible(false);
+    this.stickThumb.setVisible(false);
   }
 
   // -------- the punch --------
@@ -2459,10 +2512,14 @@ class GameScene extends Phaser.Scene {
     const k = this.keys;
     let ix = ((k.D.isDown || k.RIGHT.isDown) ? 1 : 0) - ((k.A.isDown || k.LEFT.isDown) ? 1 : 0);
     let iy = ((k.S.isDown || k.DOWN.isDown) ? 1 : 0) - ((k.W.isDown || k.UP.isDown) ? 1 : 0);
-    const mag = Math.hypot(ix, iy);
+    let mag = Math.hypot(ix, iy);
+    if (mag > 0) { ix /= mag; iy /= mag; mag = 1; }
+    if (this.stick.active && this.stick.mag > 0.12) {
+      ix = this.stick.nx; iy = this.stick.ny;
+      mag = Math.min(1, this.stick.mag * 1.15);   // analog walk speed
+    }
     if (mag > 0) {
-      ix /= mag; iy /= mag;
-      this.player.setVelocity(ix * playerSpeed(), iy * playerSpeed());
+      this.player.setVelocity(ix * playerSpeed() * mag, iy * playerSpeed() * mag);
       this.facing = { x: ix, y: iy };
     } else {
       this.player.setVelocity(0, 0);
